@@ -137,6 +137,15 @@ def station_footprint(pos: Pos) -> tuple[Pos, ...]:
     )
 
 
+def station_cells(pos: Pos) -> tuple[Pos, ...]:
+    # 覆盖「左上角」与「左下角」两种 2x2 解读，避免走进基地占格
+    return tuple({
+        *station_footprint(pos),
+        Pos(pos.x, pos.y + 1),
+        Pos(pos.x + 1, pos.y + 1),
+    })
+
+
 def day_index(round_no: int) -> int:
     return (round_no - 1) // ROUNDS_PER_DAY + 1
 
@@ -294,6 +303,7 @@ class Turn:
     last_summon_result: int
     errors: tuple[int, ...]
     error_msgs: tuple[str, ...]
+    last_action_ok: dict[int, bool]
 
     @classmethod
     def load(cls, payload: dict[str, Any]) -> "Turn":
@@ -349,6 +359,10 @@ class Turn:
                 str(err.get("description") or "")
                 for err in payload.get("errors") or ()
             ),
+            {
+                int(key): bool(value)
+                for key, value in (payload.get("lastRoundRoleActionResults") or {}).items()
+            },
         )
 
     @property
@@ -434,7 +448,7 @@ class Turn:
 
     def footprint(self, unit: Unit) -> tuple[Pos, ...]:
         if unit.kind == STATION:
-            return station_footprint(unit.pos)
+            return station_cells(unit.pos)
         return (unit.pos,)
 
     def land(self, pos: Pos) -> bool:
@@ -458,7 +472,7 @@ class Turn:
             if enemy.kind in CONTROLLABLE_TYPES and enemy.health > 0:
                 cells.add(enemy.pos)
             elif enemy.kind == STATION:
-                cells.update(station_footprint(enemy.pos))
+                cells.update(station_cells(enemy.pos))
             elif enemy.health > 0:
                 cells.add(enemy.pos)
         return frozenset(cells)

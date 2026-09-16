@@ -73,6 +73,8 @@ class Memory:
     task_started_round: int = 0
     abandon_task: bool = False
     skip_task_until: int = 0
+    last_move: dict[int, Pos] = field(default_factory=dict)
+    failed_steps: dict[int, set[Pos]] = field(default_factory=dict)
 
 
 MEM = Memory()
@@ -91,6 +93,8 @@ def reset_memory() -> None:
     MEM.last_folk = ""
     MEM.last_official = ""
     MEM.skip_task_until = 0
+    MEM.last_move.clear()
+    MEM.failed_steps.clear()
     _clear_task()
 
 
@@ -118,6 +122,7 @@ def observe(turn: Turn) -> None:
             MEM.events.append(event)
 
     _observe_task(turn)
+    _observe_moves(turn)
 
     if 5 in turn.errors and MEM.llm_used < LLM_DAILY_LIMIT:
         MEM.llm_used = LLM_DAILY_LIMIT
@@ -151,6 +156,37 @@ def can_prompt(turn: Turn) -> bool:
 def mark_prompt(turn: Turn) -> None:
     if not turn.phase_task.strip():
         MEM.llm_used += 1
+
+
+def _observe_moves(turn: Turn) -> None:
+    for unit_id, ok in turn.last_action_ok.items():
+        dest = MEM.last_move.get(unit_id)
+        if ok:
+            MEM.failed_steps.pop(unit_id, None)
+            continue
+        if dest is None:
+            continue
+        bucket = MEM.failed_steps.setdefault(unit_id, set())
+        bucket.add(dest)
+        if len(bucket) > 16:
+            bucket.clear()
+            bucket.add(dest)
+
+
+def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
+    MEM.last_move.clear()
+    for unit_id, command in commands.items():
+        if command.get("action") != "move":
+            continue
+        targets = command.get("targetPos") or ()
+        if not targets:
+            continue
+        raw = targets[0]
+        MEM.last_move[unit_id] = Pos(int(raw["x"]), int(raw["y"]))
+
+
+def failed_cells(unit_id: int) -> frozenset[Pos]:
+    return frozenset(MEM.failed_steps.get(unit_id) or ())
 
 
 def _clear_task() -> None:

@@ -8,6 +8,7 @@ from .intel import (
     MEM,
     can_prompt,
     dump_ore,
+    failed_cells,
     hold_ore,
     mark_prompt,
     mine_rank,
@@ -16,6 +17,7 @@ from .intel import (
     parse_sandbox_answer,
     patch_task_answer,
     remember_answer,
+    remember_commands,
     should_abandon_task,
     treasure_imminent,
     treasure_prompt,
@@ -75,6 +77,7 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
         prompt, execute_cmd = _day(turn, commands)
     else:
         prompt = _night(turn, commands)
+    remember_commands(commands)
     return {
         "roleCommandMap": {
             str(key): value for key, value in commands.items()
@@ -1119,12 +1122,19 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
+    avoid = set(failed_cells(role.unit_id)) | claimed
     for stand in _stand_cells(turn, role, target, claimed, inside_only):
         if stand == role.pos:
             return None
-        step = next_step(turn, role, stand)
-        if step is None or step in claimed:
+        if stand in avoid and stand != target:
             continue
+        step = next_step(turn, role, stand, avoid)
+        if step is None or step in avoid:
+            continue
+        claimed.add(step)
+        return step
+    step = next_step(turn, role, target, avoid)
+    if step is not None and step not in avoid:
         claimed.add(step)
         return step
     return None

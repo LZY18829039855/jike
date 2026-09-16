@@ -10,8 +10,16 @@ _STEPS = (
 )
 
 
-def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
-    blocked = turn.blocked(moving)
+def next_step(
+    turn: Turn,
+    moving: Unit,
+    goal: Pos,
+    extra_blocked: frozenset[Pos] | set[Pos] = frozenset(),
+) -> Pos | None:
+    blocked = set(turn.blocked(moving))
+    blocked.update(extra_blocked)
+    if moving.pos == goal:
+        return None
     order = count()
     frontier: list[tuple[int, int, int, Pos]] = [
         (distance(moving.pos, goal), 0, next(order), moving.pos)
@@ -45,11 +53,30 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
                     step,
                 ),
             )
-    return None
+    return _greedy_step(turn, moving, goal, blocked)
+
+
+def _greedy_step(
+    turn: Turn, moving: Unit, goal: Pos, blocked: set[Pos],
+) -> Pos | None:
+    now = distance(moving.pos, goal)
+    options: list[tuple[int, int, int, Pos]] = []
+    for dx, dy in _STEPS:
+        step = Pos(moving.pos.x + dx, moving.pos.y + dy)
+        if step in blocked or not turn.land(step):
+            continue
+        options.append((distance(step, goal), abs(dx) + abs(dy), step.x + step.y, step))
+    if not options:
+        return None
+    options.sort()
+    best = options[0][3]
+    if distance(best, goal) >= now and now <= 1:
+        return None
+    return best
 
 
 def _first_step(came_from: dict[Pos, Pos], start: Pos, goal: Pos) -> Pos:
     current = goal
-    while came_from[current] != start:
+    while came_from.get(current, start) != start:
         current = came_from[current]
     return current
