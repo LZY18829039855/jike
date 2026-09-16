@@ -66,6 +66,13 @@ class Memory:
     prompted_task: str = ""
     last_folk: str = ""
     last_official: str = ""
+    task_fails: int = 0
+    task_answer: str = ""
+    task_required: list[str] = field(default_factory=list)
+    task_forbidden: list[str] = field(default_factory=list)
+    task_started_round: int = 0
+    abandon_task: bool = False
+    skip_task_until: int = 0
 
 
 MEM = Memory()
@@ -83,6 +90,8 @@ def reset_memory() -> None:
     MEM.prompted_task = ""
     MEM.last_folk = ""
     MEM.last_official = ""
+    MEM.skip_task_until = 0
+    _clear_task()
 
 
 def observe(turn: Turn) -> None:
@@ -107,6 +116,8 @@ def observe(turn: Turn) -> None:
         if event is not None:
             MEM.events = [item for item in MEM.events if item.ore != event.ore]
             MEM.events.append(event)
+
+    _observe_task(turn)
 
     if 5 in turn.errors and MEM.llm_used < LLM_DAILY_LIMIT:
         MEM.llm_used = LLM_DAILY_LIMIT
@@ -140,6 +151,113 @@ def can_prompt(turn: Turn) -> bool:
 def mark_prompt(turn: Turn) -> None:
     if not turn.phase_task.strip():
         MEM.llm_used += 1
+
+
+def _clear_task() -> None:
+    MEM.task_fails = 0
+    MEM.task_answer = ""
+    MEM.task_required.clear()
+    MEM.task_forbidden.clear()
+    MEM.task_started_round = 0
+    MEM.abandon_task = False
+    MEM.awaiting_task = False
+    MEM.prompted_task = ""
+
+
+def _observe_task(turn: Turn) -> None:
+    task = turn.phase_task.strip()
+    if not task:
+        _clear_task()
+        return
+    if MEM.prompted_task and MEM.prompted_task != task and MEM.task_started_round:
+        _clear_task()
+    if MEM.task_started_round == 0:
+        MEM.task_started_round = turn.round_no
+        MEM.prompted_task = task
+    for code, msg in zip(turn.errors, turn.error_msgs):
+        _ingest_schema_error(msg)
+        if code in {1, 2}:
+            MEM.task_fails += 1
+    if should_abandon_task(turn):
+        MEM.abandon_task = True
+        if MEM.skip_task_until < turn.round_no:
+            MEM.skip_task_until = turn.round_no + 32
+
+
+def should_abandon_task(turn: Turn) -> bool:
+    if MEM.abandon_task:
+        return True
+    if MEM.task_fails >= 3:
+        return True
+    if 1 in turn.errors:
+        return True
+    if turn.near_night:
+        return True
+    timeout = 0
+    for task in turn.tasks:
+        timeout = max(timeout, task.timeout_rounds)
+    if timeout and MEM.task_started_round:
+        used = turn.round_no - MEM.task_started_round
+        if used >= max(timeout - 2, 8):
+            return True
+    return False
+
+
+def remember_answer(answer: str) -> None:
+    MEM.task_answer = answer
+    MEM.awaiting_task = False
+
+
+def patch_task_answer(raw: str, turn: Turn) -> str:
+    blob = (raw or MEM.task_answer or "").strip()
+    obj, is_obj = _as_object(blob)
+    for key in list(MEM.task_forbidden):
+        obj.pop(key, None)
+    for key in MEM.task_required:
+        if key not in obj:
+            obj[key] = _default_field(key, blob, turn)
+    if not is_obj and not MEM.task_required:
+        return blob
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _ingest_schema_error(msg: str) -> None:
+    match = re.search(r"\$/([A-Za-z0-9_]+)\s*[:：]\s*(缺少键|多余键|值不符)", msg)
+    if not match:
+        return
+    key, kind = match.group(1), match.group(2)
+    if kind == "缺少键":
+        if key not in MEM.task_required:
+            MEM.task_required.append(key)
+        if key in MEM.task_forbidden:
+            MEM.task_forbidden.remove(key)
+    elif kind == "多余键":
+        if key not in MEM.task_forbidden:
+            MEM.task_forbidden.append(key)
+        if key in MEM.task_required:
+            MEM.task_required.remove(key)
+
+
+def _as_object(blob: str) -> tuple[dict[str, Any], bool]:
+    if blob.startswith("{") and blob.endswith("}"):
+        try:
+            data = json.loads(blob)
+            if isinstance(data, dict):
+                return dict(data), True
+        except json.JSONDecodeError:
+            pass
+    return {}, False
+
+
+def _default_field(key: str, blob: str, turn: Turn) -> Any:
+    if key.endswith("_count") or key.endswith("Count"):
+        nums = re.findall(r"\d+", turn.last_cmd_result or blob)
+        return int(nums[-1]) if nums else 0
+    if key.lower() == "token":
+        if blob and not blob.startswith("{"):
+            return blob
+        return _extract_tag(turn.llm_resp, "ANSWER") or blob[:80]
+    return ""
 
 
 def mine_blocked(turn: Turn, ore: str) -> bool:

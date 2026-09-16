@@ -14,6 +14,9 @@ from .intel import (
     missing_ritual,
     observe,
     parse_sandbox_answer,
+    patch_task_answer,
+    remember_answer,
+    should_abandon_task,
     treasure_imminent,
     treasure_prompt,
     treasure_ready,
@@ -120,6 +123,8 @@ def _day(
             commands,
             budget,
         )
+        if role.unit_id not in commands:
+            _idle_work(turn, role, claimed, commands)
     return prompt, execute_cmd
 
 
@@ -226,11 +231,15 @@ def _pioneer_day(
             return "", ""
 
     if turn.phase_task.strip():
-        prompt, execute_cmd = _solve_task(turn, role, commands)
-        if role.unit_id in commands or prompt or execute_cmd:
-            return prompt, execute_cmd
-        if _stay_on_task(turn, role, claimed, commands):
-            return "", ""
+        if should_abandon_task(turn):
+            if _leave_task(turn, role, claimed, commands):
+                return "", ""
+        else:
+            prompt, execute_cmd = _solve_task(turn, role, commands)
+            if role.unit_id in commands or prompt or execute_cmd:
+                return prompt, execute_cmd
+            if _stay_on_task(turn, role, claimed, commands):
+                return "", ""
 
     prompt = _maybe_treasure_prompt(turn)
 
@@ -248,7 +257,7 @@ def _pioneer_day(
     tasks = turn.available_tasks()
     skip_task = turn.near_night or (
         treasure_imminent(turn) and MEM.treasure.pos is not None
-    )
+    ) or turn.round_no < MEM.skip_task_until
     if tasks and not skip_task:
         task = max(tasks, key=lambda item: (item.score_reward, item.gold_reward))
         if distance(role.pos, task.pos) <= 1:
@@ -264,6 +273,44 @@ def _pioneer_day(
     elif towers_missing:
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
     return prompt, ""
+
+
+def _leave_task(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    station = turn.station()
+    target = station.pos if station else role.pos
+    weapons = turn.weapons()
+    if weapons:
+        target = min(weapons, key=lambda unit: distance(role.pos, unit.pos)).pos
+    step = _step_toward(turn, role, target, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
+        return True
+    for dx, dy in _NEIGHBOUR_STEPS:
+        pos = Pos(role.pos.x + dx, role.pos.y + dy)
+        if turn.land(pos) and pos not in claimed:
+            commands[role.unit_id] = move_command(pos)
+            claimed.add(pos)
+            return True
+    return False
+
+
+def _idle_work(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    if turn.near_night and _man_tower(turn, role, claimed, commands):
+        return
+    if _mine_economy(turn, role, claimed, commands, keep_stone=False):
+        return
+    if turn.weapons():
+        _man_tower(turn, role, claimed, commands)
 
 
 def _stay_on_task(
@@ -372,8 +419,9 @@ def _solve_task(
     if resp:
         answer = _extract_tag(resp, "ANSWER")
         if answer:
-            commands[role.unit_id] = submit_answer_command(answer)
-            MEM.awaiting_task = False
+            payload = patch_task_answer(answer, turn)
+            remember_answer(payload)
+            commands[role.unit_id] = submit_answer_command(payload)
             return "", ""
         cmd = _extract_tag(resp, "CMD")
         if cmd:
@@ -382,9 +430,17 @@ def _solve_task(
 
     sandbox = parse_sandbox_answer(turn.last_cmd_result)
     if sandbox:
-        commands[role.unit_id] = submit_answer_command(sandbox)
-        MEM.awaiting_task = False
+        payload = patch_task_answer(sandbox, turn)
+        remember_answer(payload)
+        commands[role.unit_id] = submit_answer_command(payload)
         return "", ""
+
+    if MEM.task_fails and (MEM.task_required or MEM.task_forbidden) and MEM.task_answer:
+        payload = patch_task_answer(MEM.task_answer, turn)
+        if payload != MEM.task_answer:
+            remember_answer(payload)
+            commands[role.unit_id] = submit_answer_command(payload)
+            return "", ""
 
     result = turn.last_cmd_result.strip()
     if result and not MEM.awaiting_task:
@@ -393,7 +449,7 @@ def _solve_task(
         mark_prompt(turn)
         return _task_prompt(turn, sandbox=result), ""
 
-    if MEM.prompted_task != turn.phase_task or not MEM.awaiting_task:
+    if not MEM.awaiting_task:
         MEM.prompted_task = turn.phase_task
         MEM.awaiting_task = True
         mark_prompt(turn)
@@ -412,14 +468,22 @@ def _task_prompt(turn: Turn, sandbox: str = "") -> str:
     folk = "\n".join(MEM.folk)
     parts = [
         "你是《未来战争》参赛 Agent 的任务求解器。沙盒无外网，可执行 shell 与 python。",
-        "若已得到最终答案，只输出一行：ANSWER:<最终答案>",
+        "若已得到最终答案，只输出一行：ANSWER:<最终答案，优先合法 JSON>",
         "若还需在沙盒执行命令，只输出一行：CMD:<单条命令>",
-        "不要输出其它解释。优先写可复用的 python3 -c 或脚本。",
+        "不要输出其它解释。JSON 必须不多不少，键名与任务要求完全一致。",
         "",
         f"【当前任务】\n{turn.phase_task}",
     ]
+    if MEM.task_required:
+        parts.append("【必须包含的键】 " + ", ".join(MEM.task_required))
+    if MEM.task_forbidden:
+        parts.append("【禁止出现的键】 " + ", ".join(MEM.task_forbidden))
+    if turn.error_msgs:
+        parts.append("【上轮判题错误】\n" + "\n".join(turn.error_msgs))
     if sandbox:
         parts.append(f"【上轮沙盒输出】\n{sandbox}")
+    if MEM.task_answer:
+        parts.append(f"【上次提交】\n{MEM.task_answer}")
     if folk:
         parts.append(f"【民间传闻累计】\n{folk}")
     if turn.official_news:

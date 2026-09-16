@@ -293,6 +293,7 @@ class Turn:
     last_cmd_result: str
     last_summon_result: int
     errors: tuple[int, ...]
+    error_msgs: tuple[str, ...]
 
     @classmethod
     def load(cls, payload: dict[str, Any]) -> "Turn":
@@ -342,6 +343,10 @@ class Turn:
             int(payload.get("lastSummonTreasureResult") or 0),
             tuple(
                 int(err.get("errorCode") or 0)
+                for err in payload.get("errors") or ()
+            ),
+            tuple(
+                str(err.get("description") or "")
                 for err in payload.get("errors") or ()
             ),
         )
