@@ -5,7 +5,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import COPPER, IRON, ITEM_ALIASES, Pos, Turn, WALL_MATERIAL
+from .protocol import (
+    COPPER,
+    IRON,
+    ITEM_ALIASES,
+    PlayerTask,
+    Pos,
+    Turn,
+    WALL_MATERIAL,
+    distance,
+)
 
 LLM_DAILY_LIMIT = 3
 DEFAULT_ORE_PRICE = {WALL_MATERIAL: 1, IRON: 3, COPPER: 5}
@@ -72,14 +81,18 @@ class Memory:
     task_forbidden: list[str] = field(default_factory=list)
     task_started_round: int = 0
     task_timeout: int = 0
+    task_pos: Pos | None = None
     task_submits: int = 0
+    pending_task_timeout: int = 0
+    pending_task_pos: Pos | None = None
+    pending_task_round: int = 0
     abandon_task: bool = False
     skip_task_until: int = 0
     last_move: dict[int, Pos] = field(default_factory=dict)
     last_build: dict[int, Pos] = field(default_factory=dict)
     failed_steps: dict[int, set[Pos]] = field(default_factory=dict)
     bad_build: set[Pos] = field(default_factory=set)
-    bad_build_day: int = 0
+    build_failures: dict[Pos, int] = field(default_factory=dict)
     good_wall: set[Pos] = field(default_factory=set)
     good_weapon: set[Pos] = field(default_factory=set)
     threat_x: int = 0
@@ -87,7 +100,8 @@ class Memory:
     threat_n: int = 0
     summon_day: int = 0
     summon_used: int = 0
-    weapon_ready_at: dict[int, int] = field(default_factory=dict)
+    last_round: int = 0
+    match_signature: tuple[Any, ...] = ()
 
 
 MEM = Memory()
@@ -110,7 +124,7 @@ def reset_memory() -> None:
     MEM.last_build.clear()
     MEM.failed_steps.clear()
     MEM.bad_build.clear()
-    MEM.bad_build_day = 0
+    MEM.build_failures.clear()
     MEM.good_wall.clear()
     MEM.good_weapon.clear()
     MEM.threat_x = 0
@@ -118,11 +132,17 @@ def reset_memory() -> None:
     MEM.threat_n = 0
     MEM.summon_day = 0
     MEM.summon_used = 0
-    MEM.weapon_ready_at.clear()
+    MEM.pending_task_timeout = 0
+    MEM.pending_task_pos = None
+    MEM.pending_task_round = 0
+    MEM.last_round = 0
+    MEM.match_signature = ()
     _clear_task()
 
 
 def observe(turn: Turn) -> None:
+    _ensure_match(turn)
+
     if MEM.llm_day != turn.day_no:
         MEM.llm_day = turn.day_no
         MEM.llm_used = 0
@@ -169,13 +189,39 @@ def observe(turn: Turn) -> None:
                 )
             if turn.last_summon_result == 3:
                 MEM.treasure.items = []
-            if turn.last_summon_result == 2:
-                nxt = (MEM.treasure.day or turn.day_no) + 1
-                MEM.treasure.day = nxt if nxt <= 10 else MEM.treasure.day
+            # 2 同时表示地点错误或时间未到，不能武断地把日期加一。
+            # 3 表示祭品错误；两种情况都要求重新推理后才能再次消耗祭品。
+            MEM.treasure.weak = True
             MEM.awaiting_treasure = False
 
     if turn.llm_resp.strip():
         _absorb_llm(turn)
+
+    MEM.last_round = turn.round_no
+
+
+def _match_signature(turn: Turn) -> tuple[Any, ...]:
+    return (
+        turn.team_id,
+        turn.team_type,
+        turn.width,
+        turn.height,
+    )
+
+
+def _ensure_match(turn: Turn) -> None:
+    signature = _match_signature(turn)
+    new_match = bool(
+        MEM.match_signature
+        and (
+            signature != MEM.match_signature
+            or turn.round_no < MEM.last_round
+            or (turn.round_no == 1 and MEM.last_round > 1)
+        )
+    )
+    if new_match:
+        reset_memory()
+    MEM.match_signature = signature
 
 
 def can_prompt(turn: Turn) -> bool:
@@ -190,11 +236,6 @@ def mark_prompt(turn: Turn) -> None:
 
 
 def _observe_moves(turn: Turn) -> None:
-    # 矿区每天会刷新，建造黑名单按天衰减，避免长期误封
-    if MEM.bad_build_day != turn.day_no:
-        MEM.bad_build_day = turn.day_no
-        MEM.bad_build.clear()
-
     for unit_id, ok in turn.last_action_ok.items():
         dest = MEM.last_move.get(unit_id)
         if ok:
@@ -203,18 +244,22 @@ def _observe_moves(turn: Turn) -> None:
             bucket = MEM.failed_steps.setdefault(unit_id, set())
             bucket.add(dest)
             if len(bucket) > 16:
-                bucket.clear()
-                bucket.add(dest)
+                victim = next((pos for pos in bucket if pos != dest), None)
+                if victim is not None:
+                    bucket.discard(victim)
 
         site = MEM.last_build.get(unit_id)
         if site is None:
             continue
         if ok:
             MEM.bad_build.discard(site)
+            MEM.build_failures.pop(site, None)
         else:
-            MEM.bad_build.add(site)
-            if len(MEM.bad_build) > 64:
-                MEM.bad_build.clear()
+            failures = MEM.build_failures.get(site, 0) + 1
+            MEM.build_failures[site] = failures
+            # 一次失败可能只是临时占格；重复失败才认定为非法建造区。
+            if failures >= 2:
+                MEM.bad_build.add(site)
 
 
 def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
@@ -279,16 +324,9 @@ def threat_anchor(turn: Turn) -> Pos:
     return Pos(turn.width // 2, turn.height // 2)
 
 
-def note_attack(turn: Turn, weapon) -> None:
-    """接口不下发武器冷却，火箭的 3 回合空窗只能自己记账。"""
-    if weapon.kind == "rocket":
-        MEM.weapon_ready_at[weapon.unit_id] = turn.round_no + 4
-
-
 def weapon_ready(turn: Turn, weapon) -> bool:
-    if weapon.cooldown > 0:
-        return False
-    return turn.round_no >= MEM.weapon_ready_at.get(weapon.unit_id, 0)
+    # 接口明确下发 cooldown，以服务端状态为唯一真值。
+    return weapon.cooldown <= 0
 
 
 def summon_budget_left() -> int:
@@ -306,6 +344,7 @@ def _clear_task() -> None:
     MEM.task_forbidden.clear()
     MEM.task_started_round = 0
     MEM.task_timeout = 0
+    MEM.task_pos = None
     MEM.task_submits = 0
     MEM.abandon_task = False
     MEM.awaiting_task = False
@@ -316,16 +355,42 @@ def _observe_task(turn: Turn) -> None:
     task = turn.phase_task.strip()
     if not task:
         _clear_task()
+        if (
+            MEM.pending_task_round
+            and turn.round_no - MEM.pending_task_round > 2
+        ):
+            MEM.pending_task_timeout = 0
+            MEM.pending_task_pos = None
+            MEM.pending_task_round = 0
         return
     if MEM.prompted_task and MEM.prompted_task != task and MEM.task_started_round:
         _clear_task()
     if MEM.task_started_round == 0:
-        MEM.task_started_round = turn.round_no
         MEM.prompted_task = task
+        if (
+            MEM.pending_task_round
+            and turn.round_no - MEM.pending_task_round <= 2
+        ):
+            MEM.task_started_round = MEM.pending_task_round
+            MEM.task_timeout = MEM.pending_task_timeout
+            MEM.task_pos = MEM.pending_task_pos
+        else:
+            MEM.task_started_round = turn.round_no
+            pioneer = turn.pioneer()
+            if pioneer is not None and turn.tasks:
+                nearest = min(
+                    turn.tasks,
+                    key=lambda item: distance(pioneer.pos, item.pos),
+                )
+                MEM.task_timeout = nearest.timeout_rounds
+                MEM.task_pos = nearest.pos
+        MEM.pending_task_timeout = 0
+        MEM.pending_task_pos = None
+        MEM.pending_task_round = 0
     if MEM.task_timeout == 0:
-        MEM.task_timeout = max(
-            (item.timeout_rounds for item in turn.tasks), default=0,
-        )
+        # 无法识别任务点时宁可使用最短超时，确保保底答案不会交晚。
+        positive = [item.timeout_rounds for item in turn.tasks if item.timeout_rounds > 0]
+        MEM.task_timeout = min(positive, default=0)
     for code, msg in zip(turn.errors, turn.error_msgs):
         _ingest_schema_error(msg)
         if code in {1, 2}:
@@ -337,7 +402,13 @@ def _observe_task(turn: Turn) -> None:
     if 1 in turn.errors or task_rounds_left(turn) <= 0:
         MEM.abandon_task = True
         if MEM.skip_task_until < turn.round_no:
-            MEM.skip_task_until = turn.round_no + 2
+            MEM.skip_task_until = turn.round_no + 30
+
+
+def remember_task_accept(task: PlayerTask, round_no: int) -> None:
+    MEM.pending_task_timeout = task.timeout_rounds
+    MEM.pending_task_pos = task.pos
+    MEM.pending_task_round = round_no
 
 
 def task_rounds_left(turn: Turn) -> int:
@@ -448,7 +519,12 @@ def dump_ore(turn: Turn, ore: str) -> bool:
     for event in MEM.events:
         if event.ore != ore:
             continue
-        if event.start_day <= turn.day_no <= event.end_day:
+        if (
+            event.kind == "shortage"
+            and event.start_day <= turn.day_no <= event.end_day
+        ):
+            return True
+        if event.kind == "surplus" and turn.day_no < event.start_day:
             return True
     price = turn.ore_price(ore)
     return price > DEFAULT_ORE_PRICE.get(ore, price)
@@ -476,6 +552,13 @@ def mine_rank(turn: Turn, keep_stone: bool) -> list[str]:
             score += 80
         if dump_ore(turn, ore) and not hold_ore(turn, ore):
             score += 15
+        if any(
+            event.ore == ore
+            and event.kind == "surplus"
+            and event.start_day <= turn.day_no <= event.end_day
+            for event in MEM.events
+        ):
+            score -= 80
         if keep_stone and ore == WALL_MATERIAL:
             score += 40
         scored.append((score, ore))
@@ -531,10 +614,14 @@ def parse_official(turn: Turn, text: str) -> MarketEvent | None:
         kind = "surplus"
     if not kind:
         return None
-    start = turn.day_no + 1
+    # 短缺新闻通常描述“今天出事、明天停采”；仅明确写了即日生效才封当天。
+    start = turn.day_no if kind == "surplus" else turn.day_no + 1
+    today_effective = (
+        "即日起", "即日停", "今日起", "今天起", "当天停工", "立即停工",
+    )
     if any(word in text for word in _TOMORROW_WORDS):
         start = turn.day_no + 1
-    elif any(word in text for word in _TODAY_WORDS) and "明天" not in text and "明日" not in text:
+    elif any(word in text for word in today_effective):
         start = turn.day_no
     duration = _first_int(text, default=2)
     duration = max(1, min(duration, 5))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from itertools import permutations
 from typing import Any
 
 from .grid import next_step
@@ -15,13 +16,13 @@ from .intel import (
     mark_prompt,
     mine_rank,
     missing_ritual,
-    note_attack,
     note_summon_used,
     observe,
     parse_sandbox_answer,
     patch_task_answer,
     remember_answer,
     remember_commands,
+    remember_task_accept,
     should_abandon_task,
     summon_budget_left,
     threat_anchor,
@@ -76,6 +77,12 @@ TOWER_LOADOUT = ("gatling", "railgun", "rocket")
 STONE_RESERVE = 8
 STONE_BATCH = 10
 SUMMON_ORDERS = (BOSS_SUMMON, LARGE_SUMMON, MIDDLE_SUMMON, SMALL_SUMMON)
+ROBOT_ATTACK = {
+    "smallRobot": 5,
+    "middleRobot": 10,
+    "largeRobot": 20,
+    "bossRobot": 40,
+}
 _NEIGHBOUR_STEPS = (
     (-1, -1), (-1, 0), (-1, 1),
     (0, -1), (0, 1),
@@ -349,7 +356,11 @@ def _pioneer_day(
 
     if turn.phase_task.strip():
         # 宝藏是全局唯一奖励且有开启窗口，只有它值得中断任务
-        grab_treasure = treasure_ready(turn) and treasure_imminent(turn)
+        grab_treasure = (
+            MEM.task_submits > 0
+            and treasure_ready(turn)
+            and treasure_imminent(turn)
+        )
         if should_abandon_task(turn) or grab_treasure:
             if grab_treasure and _hunt_treasure(turn, role, claimed, commands):
                 return "", ""
@@ -381,9 +392,10 @@ def _pioneer_day(
         treasure_imminent(turn) and MEM.treasure.pos is not None
     ) or turn.round_no < MEM.skip_task_until
     if tasks and not skip_task:
-        task = max(tasks, key=lambda item: (item.score_reward, item.gold_reward))
+        task = max(tasks, key=lambda item: _task_value(turn, role, item))
         if distance(role.pos, task.pos) <= 1:
             commands[role.unit_id] = accept_task_command()
+            remember_task_accept(task, turn.round_no)
             return prompt, ""
         step = _step_toward(turn, role, task.pos, claimed)
         if step is not None:
@@ -395,6 +407,22 @@ def _pioneer_day(
     elif towers_missing:
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
     return prompt, ""
+
+
+def _task_value(turn: Turn, role: Unit, task) -> tuple[float, float, int]:
+    travel = max(0, distance(role.pos, task.pos) - 1)
+    timeout = task.timeout_rounds or 25
+    solve_rounds = min(12, max(4, timeout // 3))
+    elapsed = max(1, travel + solve_rounds)
+    speed_bonus = 5.0 * timeout / solve_rounds if task.timeout_rounds else 0.0
+    expected = task.score_reward + speed_bonus + task.gold_reward * 0.4
+    # 临近夜晚时额外惩罚长路任务，避免开拓者滞留野外。
+    night_penalty = max(0, turn.round_of_day + travel - 60) * 2
+    return (
+        (expected - night_penalty) / elapsed,
+        expected,
+        -travel,
+    )
 
 
 def _leave_task(
@@ -695,7 +723,6 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> str:
         targets = _attack_targets(turn, pick)
         if targets:
             commands[pick.unit_id] = attack_command(role.unit_id, *targets)
-            note_attack(turn, pick)
             fired.add(pick.unit_id)
             used_controllers.add(role.unit_id)
     return prompt
@@ -709,21 +736,26 @@ def _assign_towers(
     towers = list(turn.weapons())
     if not roles or not towers:
         return []
-    pairs: list[tuple[Unit, Unit]] = []
-    remaining = set(range(len(roles)))
-    for tower in towers:
-        best_idx = min(
-            remaining,
-            key=lambda idx: (
-                distance(roles[idx].pos, tower.pos),
-                roles[idx].unit_id,
-            ),
+    if len(roles) >= len(towers):
+        candidates = (
+            list(zip(assignment, towers))
+            for assignment in permutations(roles, len(towers))
         )
-        pairs.append((roles[best_idx], tower))
-        remaining.remove(best_idx)
-        if not remaining:
-            break
-    return pairs
+    else:
+        candidates = (
+            list(zip(roles, assignment))
+            for assignment in permutations(towers, len(roles))
+        )
+
+    def key(pairs: list[tuple[Unit, Unit]]) -> tuple:
+        distances = [distance(role.pos, tower.pos) for role, tower in pairs]
+        return (
+            sum(distances),
+            max(distances, default=0),
+            tuple((role.unit_id, tower.unit_id) for role, tower in pairs),
+        )
+
+    return min(candidates, key=key)
 
 
 def _try_combat_item(
@@ -788,12 +820,6 @@ def _attack_targets(turn: Turn, tower: Unit) -> list[Pos]:
         if distance(tower.pos, robot.pos) <= reach
     ]
     if not candidates:
-        # 打任意可见机器人（含打对面的），赚击杀分
-        candidates = [
-            robot for robot in turn.robots
-            if robot.health > 0 and distance(tower.pos, robot.pos) <= reach
-        ]
-    if not candidates:
         return []
 
     shots = tower.shot_count()
@@ -801,18 +827,22 @@ def _attack_targets(turn: Turn, tower: Unit) -> list[Pos]:
         target = max(candidates, key=lambda robot: _railgun_score(turn, tower, robot))
         return [target.pos]
     if tower.kind == "gatling":
-        return _gatling_targets(tower, candidates, shots)
+        return _gatling_targets(turn, tower, candidates, shots)
     return _rocket_targets(turn, tower, candidates, shots)
 
 
 def _threat_key(turn: Turn, robot: Robot) -> tuple:
     station = turn.station()
-    base_dist = distance(station.pos, robot.pos) if station else 0
-    finishable = 1 if robot.health <= 40 else 0
+    base_dist = distance(station.pos, robot.pos) if station else 99
+    attack = ROBOT_ATTACK.get(robot.kind, 5)
+    immediate = 1 if base_dist <= 4 else 0
+    finishable = 1 if robot.health <= 60 else 0
     return (
-        robot.kill_score,
-        finishable,
+        immediate,
+        attack,
         -base_dist,
+        finishable,
+        robot.kill_score,
         -robot.health,
         -robot.robot_id,
     )
@@ -855,16 +885,11 @@ def _on_fire_line(origin: Pos, target: Pos, point: Pos) -> bool:
 
 
 def _gatling_targets(
-    tower: Unit, candidates: list[Robot], shots: int,
+    turn: Turn, tower: Unit, candidates: list[Robot], shots: int,
 ) -> list[Pos]:
     ordered = sorted(
         candidates,
-        key=lambda robot: (
-            robot.kill_score,
-            -robot.health,
-            -distance(tower.pos, robot.pos),
-            -robot.robot_id,
-        ),
+        key=lambda robot: _threat_key(turn, robot),
         reverse=True,
     )
     primary = ordered[0]
@@ -1090,7 +1115,7 @@ def _buy_or_walk(
     budget: int,
 ) -> int | None:
     shop = turn.shop_pos()
-    if shop is None or len(turn.weapons()) < 3:
+    if shop is None:
         return None
 
     want = _wanted_purchase(turn, role, budget)
@@ -1121,32 +1146,33 @@ def _wanted_purchase(
             return name, price
         return None
 
-    # 1) 围墙升级：20 金 +500 血，性价比最高
+    # 1) 基地是唯一硬性败负条件，先确保升到 L2。
+    if station is not None and station.level == 1:
+        item = can_buy(STATION_UPGRADE_1)
+        if item:
+            return item
+    # 2) 再升级最可能承伤的墙。
     if any(wall.level == 1 for wall in walls):
         item = can_buy(WALL_UPGRADE_1)
         if item:
             return item
-    # 2) 基地血量直接决定胜负
-    if station is not None and station.level == 1:
-        item = can_buy(STATION_UPGRADE_1)
+    # 3) 武器升级同时增加火力、射程和血量。
+    if any(tower.level == 1 for tower in weapons):
+        item = can_buy(WEAPON_UPGRADE_1)
+        if item:
+            return item
+    # 进入最高等级前再强化基地，避免所有钱耗在多面墙上。
+    if station is not None and station.level == 2:
+        item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
     if any(wall.level == 2 for wall in walls):
         item = can_buy(WALL_UPGRADE_2)
         if item:
             return item
-    if station is not None and station.level == 2:
-        item = can_buy(STATION_UPGRADE_2)
-        if item:
-            return item
-    # 3) 残墙先补血，比重建便宜
+    # 4) 残墙先补血，比重建便宜。
     if any(wall.health * 5 < _wall_max_hp(wall) * 3 for wall in walls):
         item = can_buy(WALL_FIXER, stack=2)
-        if item:
-            return item
-    # 4) 武器升级排在生存之后
-    if any(tower.level == 1 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_1)
         if item:
             return item
     if any(tower.level == 2 for tower in weapons):
@@ -1162,6 +1188,13 @@ def _wanted_purchase(
         item = can_buy(MEDICINE, stack=2)
         if item:
             return item
+    # 落后终局或对方基地残血时，把金币直接转换为进攻压力。
+    if _aggressive_endgame(turn):
+        order = _summon_pick(turn, budget)
+        if order is not None:
+            item = can_buy(order, stack=1)
+            if item:
+                return item
     # 5) 炸弹 100 金在 3x3 内打 100 点，可以囤
     if turn.day_no >= 3:
         item = can_buy(BOMB, stack=2)
@@ -1180,8 +1213,23 @@ def _wanted_purchase(
     return None
 
 
+def _aggressive_endgame(turn: Turn) -> bool:
+    enemy_station = turn.enemy_station()
+    return bool(
+        (enemy_station is not None and enemy_station.health <= 1800)
+        or (turn.day_no >= 7 and turn.score_gap < 0)
+        or turn.day_no >= 9
+    )
+
+
 def _summon_pick(turn: Turn, budget: int) -> str | None:
-    if turn.day_no < 4 or summon_budget_left() <= 0:
+    enemy_station = turn.enemy_station()
+    enemy_weak = enemy_station is not None and enemy_station.health <= 1800
+    behind_late = turn.day_no >= 7 and turn.score_gap < 0
+    if (
+        summon_budget_left() <= 0
+        or (turn.day_no < 3 and not enemy_weak)
+    ):
         return None
     station = turn.station()
     fully_upgraded = (
@@ -1189,7 +1237,10 @@ def _summon_pick(turn: Turn, budget: int) -> str | None:
         and station.level >= 3
         and all(tower.level >= 2 for tower in turn.weapons())
     )
-    reserve = 60 if fully_upgraded else 220
+    if enemy_weak or behind_late or turn.day_no >= 9:
+        reserve = 40
+    else:
+        reserve = 60 if fully_upgraded else 180
     spare = budget - reserve
     for name in SUMMON_ORDERS:
         if spare >= turn.shop_price(name):

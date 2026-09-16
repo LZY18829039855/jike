@@ -142,12 +142,8 @@ def station_footprint(pos: Pos) -> tuple[Pos, ...]:
 
 
 def station_cells(pos: Pos) -> tuple[Pos, ...]:
-    # 覆盖「左上角」与「左下角」两种 2x2 解读，避免走进基地占格
-    return tuple({
-        *station_footprint(pos),
-        Pos(pos.x, pos.y + 1),
-        Pos(pos.x + 1, pos.y + 1),
-    })
+    # 基地坐标按左上角解释，严格使用规则中的 2x2 占格。
+    return station_footprint(pos)
 
 
 def day_index(round_no: int) -> int:
@@ -290,6 +286,9 @@ class Turn:
     round_of_day: int
     gold: int
     team_type: str
+    team_id: str
+    total_score: float
+    enemy_total_score: float
     width: int
     height: int
     zones: dict[Pos, str]
@@ -314,6 +313,7 @@ class Turn:
         round_no = int(payload["roundNo"])
         info = payload["mapInfo"]
         team = payload["teamOur"]
+        enemy_team = payload.get("teamEnemy") or {}
         news = payload.get("worldNews") or {}
         vendor_prices = dict(DEFAULT_ORE_PRICE)
         for entry in payload.get("vendorShopList") or ():
@@ -328,6 +328,9 @@ class Turn:
             round_in_day(round_no),
             int(team.get("goldNum") or 0),
             str(team.get("type") or ""),
+            str(team.get("teamId") or ""),
+            float(team.get("totalScore") or 0),
+            float(enemy_team.get("totalScore") or 0),
             int(info["width"]),
             int(info["height"]),
             {
@@ -337,7 +340,7 @@ class Turn:
             tuple(Unit.load(role) for role in team.get("roles") or ()),
             tuple(
                 Unit.load(role)
-                for role in (payload.get("teamEnemy") or {}).get("roles") or ()
+                for role in enemy_team.get("roles") or ()
             ),
             tuple(
                 Robot.load(robot)
@@ -378,6 +381,20 @@ class Turn:
             if unit.kind == STATION:
                 return unit
         return None
+
+    def enemy_station(self) -> Unit | None:
+        for unit in self.enemies:
+            if unit.kind == STATION and unit.health > 0:
+                return unit
+        return None
+
+    @property
+    def rounds_left(self) -> int:
+        return max(0, 1300 - self.round_no)
+
+    @property
+    def score_gap(self) -> float:
+        return self.total_score - self.enemy_total_score
 
     def pioneer(self) -> Unit | None:
         roles = self.alive((PIONEER,))

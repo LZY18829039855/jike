@@ -1,11 +1,13 @@
 import json
 import logging
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .brain import decide
 
 LOGGER = logging.getLogger(__name__)
+DECIDE_LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -14,7 +16,9 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
-            decision = decide(payload)
+            # 决策器含跨回合记忆；必须按请求串行更新，避免状态交叉污染。
+            with DECIDE_LOCK:
+                decision = decide(payload)
             if "roleCommandMap" not in decision:
                 decision = {
                     "roleCommandMap": decision,

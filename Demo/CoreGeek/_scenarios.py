@@ -49,7 +49,7 @@ left_point = 0
 for i in range(1, 25):
     f = frame(roundNo=10 + i, phaseTask="给出 token")
     role(f, 10011)["pos"] = {"x": 14, "y": 15}
-    f["errors"] = [{"errorCode": 2, "errorMsg": "键值比对不通过: $/token: 值不符"}]
+    f["errors"] = [{"errorCode": 2, "description": "键值比对不通过: $/token: 值不符"}]
     f["llmResp"] = 'ANSWER:{"token":"abc%d"}' % i
     out = cmds(decide(f))
     cmd = out.get(10011, {})
@@ -117,15 +117,20 @@ if built.get("action") == "build":
     role(f2, 10010)["pos"] = {"x": 6, "y": 21}
     role(f2, 10010)["backpack"] = ["stone"] * 12
     f2["lastRoundRoleActionResults"] = {"10010": False}
-    decide(f2)
+    retry = cmds(decide(f2)).get(10010, {})
+    f3 = frame(roundNo=5)
+    role(f3, 10010)["pos"] = {"x": 6, "y": 21}
+    role(f3, 10010)["backpack"] = ["stone"] * 12
+    f3["lastRoundRoleActionResults"] = {"10010": False}
+    decide(f3)
     from agent.intel import bad_build_cells
     from agent.protocol import Pos
 
     banned = bad_build_cells()
     check(
-        "建造失败的格子进黑名单",
+        "建造连续失败的格子进黑名单",
         Pos(target["x"], target["y"]) in banned,
-        f"{target} -> {sorted((p.x, p.y) for p in banned)}",
+        f"{target}, retry={retry} -> {sorted((p.x, p.y) for p in banned)}",
     )
 
 # ------------------------------------------------------------ 采购优先级
@@ -138,8 +143,8 @@ w["backpack"] = []
 out = cmds(decide(f))
 buy = out.get(10010, {})
 check(
-    "有钱时先买围墙升级券",
-    buy.get("action") == "buy" and buy.get("name") == "WallUpgradeVoucher1",
+    "有钱时先升级基地到 L2",
+    buy.get("action") == "buy" and buy.get("name") == "StationUpgradeVoucher1",
     buy,
 )
 
@@ -190,8 +195,7 @@ out1 = cmds(decide(f))
 attacks1 = {k: v for k, v in out1.items() if v.get("action") == "attack"}
 check("夜晚三塔齐射", len(attacks1) >= 2, sorted(attacks1))
 rocket_fired = 10040 in attacks1
-ready_at = dict(MEM.weapon_ready_at)
-check("火箭开火后记下冷却", not rocket_fired or ready_at.get(10040, 0) > 80, ready_at)
+check("火箭首回合可开火", rocket_fired, sorted(attacks1))
 
 f2 = frame(roundNo=81)
 role(f2, 10010)["pos"] = {"x": 9, "y": 23}
@@ -200,6 +204,9 @@ role(f2, 10011)["pos"] = {"x": 10, "y": 26}
 for r in f2["robot"]["roles"]:
     r["pos"] = {"x": 9, "y": 21}
     r["abnormalState"] = ""
+for r in f2["teamOur"]["roles"]:
+    if r["roleType"] == "rocket":
+        r["cooldown"] = 3
 out2 = cmds(decide(f2))
 attacks2 = {k: v for k, v in out2.items() if v.get("action") == "attack"}
 check("冷却回合火箭不再开火", 10040 not in attacks2, sorted(attacks2))
@@ -221,6 +228,79 @@ check(
     "加特林 level3 传 3 个目标",
     gat.get("action") != "attack" or len(gat["targetPos"]) == 3,
     gat,
+)
+
+# ------------------------------------------------ 生命周期、协议与新闻
+from agent.intel import parse_official, remember_task_accept
+from agent.protocol import PlayerTask, Pos, Turn, station_cells
+
+check(
+    "基地严格占用 2x2 四格",
+    len(station_cells(Pos(10, 24))) == 4
+    and Pos(10, 25) not in station_cells(Pos(10, 24)),
+)
+
+reset_memory()
+old = frame(roundNo=100)
+old["worldNews"] = {"officialNews": "", "folkLegends": ""}
+decide(old)
+MEM.official.append((1, "上一半场残留"))
+new = frame(roundNo=1)
+new["worldNews"] = {"officialNews": "", "folkLegends": ""}
+decide(new)
+check("roundNo 回退时重置半场记忆", not MEM.official, MEM.official)
+
+reset_memory()
+news_turn = Turn.load(frame(roundNo=1))
+event = parse_official(
+    news_turn,
+    "今天铁矿发生塌方，浅层仍可抢采，明天全面停工，修复需要2天。",
+)
+check(
+    "今天事故、明天停采不会提前封矿",
+    event is not None and event.start_day == 2 and event.end_day == 3,
+    event,
+)
+
+reset_memory()
+chosen = PlayerTask("短任务", Pos(14, 14), 0, 50, 30, True, 12)
+remember_task_accept(chosen, 10)
+active = frame(roundNo=11, phaseTask="短任务正文")
+role(active, 10011)["pos"] = {"x": 14, "y": 15}
+decide(active)
+check(
+    "任务使用实际领取点的 timeoutRounds",
+    MEM.task_timeout == 12 and MEM.task_pos == Pos(14, 14),
+    (MEM.task_timeout, MEM.task_pos),
+)
+
+reset_memory()
+probe = frame(roundNo=20)
+decide(probe)
+MEM.treasure.pos = Pos(20, 10)
+MEM.treasure.items = ["StarSand"]
+MEM.treasure.day = 3
+failed = frame(roundNo=21, lastSummonTreasureResult=2)
+decide(failed)
+check(
+    "宝藏结果码2不再武断修改日期",
+    MEM.treasure.day == 3 and MEM.treasure.weak,
+    (MEM.treasure.day, MEM.treasure.weak),
+)
+
+reset_memory()
+enemy_only = frame(roundNo=80)
+role(enemy_only, 10010)["pos"] = {"x": 9, "y": 23}
+role(enemy_only, 10012)["pos"] = {"x": 8, "y": 25}
+role(enemy_only, 10011)["pos"] = {"x": 10, "y": 26}
+for robot in enemy_only["robot"]["roles"]:
+    robot["pos"] = {"x": 9, "y": 21}
+    robot["targetTeam"] = "defender"
+out = cmds(decide(enemy_only))
+check(
+    "不帮助对手清理进攻其基地的机器人",
+    not any(cmd.get("action") == "attack" for cmd in out.values()),
+    out,
 )
 
 # --------------------------------------------------------------- 汇总
