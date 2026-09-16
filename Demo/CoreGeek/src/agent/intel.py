@@ -71,10 +71,23 @@ class Memory:
     task_required: list[str] = field(default_factory=list)
     task_forbidden: list[str] = field(default_factory=list)
     task_started_round: int = 0
+    task_timeout: int = 0
+    task_submits: int = 0
     abandon_task: bool = False
     skip_task_until: int = 0
     last_move: dict[int, Pos] = field(default_factory=dict)
+    last_build: dict[int, Pos] = field(default_factory=dict)
     failed_steps: dict[int, set[Pos]] = field(default_factory=dict)
+    bad_build: set[Pos] = field(default_factory=set)
+    bad_build_day: int = 0
+    good_wall: set[Pos] = field(default_factory=set)
+    good_weapon: set[Pos] = field(default_factory=set)
+    threat_x: int = 0
+    threat_y: int = 0
+    threat_n: int = 0
+    summon_day: int = 0
+    summon_used: int = 0
+    weapon_ready_at: dict[int, int] = field(default_factory=dict)
 
 
 MEM = Memory()
@@ -94,7 +107,18 @@ def reset_memory() -> None:
     MEM.last_official = ""
     MEM.skip_task_until = 0
     MEM.last_move.clear()
+    MEM.last_build.clear()
     MEM.failed_steps.clear()
+    MEM.bad_build.clear()
+    MEM.bad_build_day = 0
+    MEM.good_wall.clear()
+    MEM.good_weapon.clear()
+    MEM.threat_x = 0
+    MEM.threat_y = 0
+    MEM.threat_n = 0
+    MEM.summon_day = 0
+    MEM.summon_used = 0
+    MEM.weapon_ready_at.clear()
     _clear_task()
 
 
@@ -103,6 +127,12 @@ def observe(turn: Turn) -> None:
         MEM.llm_day = turn.day_no
         MEM.llm_used = 0
         MEM.awaiting_treasure = False
+
+    if MEM.summon_day != turn.day_no:
+        MEM.summon_day = turn.day_no
+        MEM.summon_used = 0
+
+    _observe_threat(turn)
 
     folk = turn.folk_legends.strip()
     if folk and folk != MEM.last_folk:
@@ -123,6 +153,7 @@ def observe(turn: Turn) -> None:
 
     _observe_task(turn)
     _observe_moves(turn)
+    _observe_zones(turn)
 
     if 5 in turn.errors and MEM.llm_used < LLM_DAILY_LIMIT:
         MEM.llm_used = LLM_DAILY_LIMIT
@@ -159,34 +190,113 @@ def mark_prompt(turn: Turn) -> None:
 
 
 def _observe_moves(turn: Turn) -> None:
+    # 矿区每天会刷新，建造黑名单按天衰减，避免长期误封
+    if MEM.bad_build_day != turn.day_no:
+        MEM.bad_build_day = turn.day_no
+        MEM.bad_build.clear()
+
     for unit_id, ok in turn.last_action_ok.items():
         dest = MEM.last_move.get(unit_id)
         if ok:
             MEM.failed_steps.pop(unit_id, None)
-            continue
-        if dest is None:
-            continue
-        bucket = MEM.failed_steps.setdefault(unit_id, set())
-        bucket.add(dest)
-        if len(bucket) > 16:
-            bucket.clear()
+        elif dest is not None:
+            bucket = MEM.failed_steps.setdefault(unit_id, set())
             bucket.add(dest)
+            if len(bucket) > 16:
+                bucket.clear()
+                bucket.add(dest)
+
+        site = MEM.last_build.get(unit_id)
+        if site is None:
+            continue
+        if ok:
+            MEM.bad_build.discard(site)
+        else:
+            MEM.bad_build.add(site)
+            if len(MEM.bad_build) > 64:
+                MEM.bad_build.clear()
 
 
 def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
     MEM.last_move.clear()
+    MEM.last_build.clear()
     for unit_id, command in commands.items():
-        if command.get("action") != "move":
+        action = command.get("action")
+        if action not in {"move", "build"}:
             continue
         targets = command.get("targetPos") or ()
         if not targets:
             continue
         raw = targets[0]
-        MEM.last_move[unit_id] = Pos(int(raw["x"]), int(raw["y"]))
+        pos = Pos(int(raw["x"]), int(raw["y"]))
+        if action == "move":
+            MEM.last_move[unit_id] = pos
+        else:
+            MEM.last_build[unit_id] = pos
 
 
 def failed_cells(unit_id: int) -> frozenset[Pos]:
     return frozenset(MEM.failed_steps.get(unit_id) or ())
+
+
+def bad_build_cells() -> frozenset[Pos]:
+    return frozenset(MEM.bad_build)
+
+
+def _observe_zones(turn: Turn) -> None:
+    """接口不给可建造区域，只能拿站得住的建筑当合法样本反推。"""
+    for wall in turn.walls():
+        MEM.good_wall.add(wall.pos)
+        MEM.bad_build.discard(wall.pos)
+    for weapon in turn.weapons():
+        MEM.good_weapon.add(weapon.pos)
+        MEM.bad_build.discard(weapon.pos)
+
+
+def wall_zone_seeds() -> frozenset[Pos]:
+    return frozenset(MEM.good_wall)
+
+
+def weapon_zone_seeds() -> frozenset[Pos]:
+    return frozenset(MEM.good_weapon)
+
+
+def _observe_threat(turn: Turn) -> None:
+    """累计敌方机器人出现位置，用来决定塔该朝哪边摆。"""
+    for robot in turn.hostile_robots():
+        MEM.threat_x += robot.pos.x
+        MEM.threat_y += robot.pos.y
+        MEM.threat_n += 1
+    if MEM.threat_n > 4000:
+        MEM.threat_x //= 2
+        MEM.threat_y //= 2
+        MEM.threat_n //= 2
+
+
+def threat_anchor(turn: Turn) -> Pos:
+    if MEM.threat_n >= 8:
+        return Pos(MEM.threat_x // MEM.threat_n, MEM.threat_y // MEM.threat_n)
+    return Pos(turn.width // 2, turn.height // 2)
+
+
+def note_attack(turn: Turn, weapon) -> None:
+    """接口不下发武器冷却，火箭的 3 回合空窗只能自己记账。"""
+    if weapon.kind == "rocket":
+        MEM.weapon_ready_at[weapon.unit_id] = turn.round_no + 4
+
+
+def weapon_ready(turn: Turn, weapon) -> bool:
+    if weapon.cooldown > 0:
+        return False
+    return turn.round_no >= MEM.weapon_ready_at.get(weapon.unit_id, 0)
+
+
+def summon_budget_left() -> int:
+    return max(0, 10 - MEM.summon_used)
+
+
+def note_summon_used() -> None:
+    MEM.summon_used += 1
 
 
 def _clear_task() -> None:
@@ -195,6 +305,8 @@ def _clear_task() -> None:
     MEM.task_required.clear()
     MEM.task_forbidden.clear()
     MEM.task_started_round = 0
+    MEM.task_timeout = 0
+    MEM.task_submits = 0
     MEM.abandon_task = False
     MEM.awaiting_task = False
     MEM.prompted_task = ""
@@ -210,37 +322,55 @@ def _observe_task(turn: Turn) -> None:
     if MEM.task_started_round == 0:
         MEM.task_started_round = turn.round_no
         MEM.prompted_task = task
+    if MEM.task_timeout == 0:
+        MEM.task_timeout = max(
+            (item.timeout_rounds for item in turn.tasks), default=0,
+        )
     for code, msg in zip(turn.errors, turn.error_msgs):
         _ingest_schema_error(msg)
         if code in {1, 2}:
             MEM.task_fails += 1
-    if should_abandon_task(turn):
+        # 答案错误后需要重新问一次 LLM，别停在等待态
+        if code == 2:
+            MEM.awaiting_task = False
+    # 任务超时即已结束，此后留在任务点没有意义
+    if 1 in turn.errors or task_rounds_left(turn) <= 0:
         MEM.abandon_task = True
         if MEM.skip_task_until < turn.round_no:
-            MEM.skip_task_until = turn.round_no + 32
+            MEM.skip_task_until = turn.round_no + 2
+
+
+def task_rounds_left(turn: Turn) -> int:
+    """timeoutRounds 未下发时返回极大值，宁可多等也不要提前放弃。"""
+    if not MEM.task_timeout or not MEM.task_started_round:
+        return 10**6
+    return MEM.task_timeout - (turn.round_no - MEM.task_started_round)
+
+
+def task_rounds_used(turn: Turn) -> int:
+    if not MEM.task_started_round:
+        return 0
+    return turn.round_no - MEM.task_started_round
 
 
 def should_abandon_task(turn: Turn) -> bool:
-    if MEM.abandon_task:
+    """只在任务已经结束时离开：答错不算结束，最高通过率会被计分。"""
+    return MEM.abandon_task
+
+
+def force_submit_now(turn: Turn) -> bool:
+    """还没交过答案就先交一份保底：部分通过率也计分，交了不亏。"""
+    if MEM.task_submits:
+        return False
+    if task_rounds_left(turn) <= 3:
         return True
-    if MEM.task_fails >= 3:
-        return True
-    if 1 in turn.errors:
-        return True
-    if turn.near_night:
-        return True
-    timeout = 0
-    for task in turn.tasks:
-        timeout = max(timeout, task.timeout_rounds)
-    if timeout and MEM.task_started_round:
-        used = turn.round_no - MEM.task_started_round
-        if used >= max(timeout - 2, 8):
-            return True
-    return False
+    # timeoutRounds 缺失时的兜底，别在一道题上空耗整个白天
+    return task_rounds_used(turn) >= 25
 
 
 def remember_answer(answer: str) -> None:
     MEM.task_answer = answer
+    MEM.task_submits += 1
     MEM.awaiting_task = False
 
 
@@ -448,6 +578,31 @@ def treasure_prompt(turn: Turn) -> str:
         "items 不能多不能少；day 是第几天开启；phase 是白天或夜晚。",
         f"上回合召唤结果码 lastSummonTreasureResult={turn.last_summon_result}（0未用 1成功 2地点/时间不对 3物品不对 4已空）",
         f"当前第{turn.day_no}天。",
+        "【民间传闻】",
+        folk,
+    ))
+
+
+def treasure_unsolved() -> bool:
+    guess = MEM.treasure
+    if guess.done:
+        return False
+    return guess.pos is None or guess.weak or not guess.items or guess.day is None
+
+
+def treasure_rider(turn: Turn) -> str:
+    """任务执行期间 LLM 不限次，顺带把宝藏问题挂在同一次提问里。"""
+    if not treasure_unsolved() or not MEM.folk:
+        return ""
+    catalog = "、".join(turn.ritual_catalog())
+    folk = "\n".join(MEM.folk)
+    return "\n".join((
+        "",
+        "【附加题：宝藏推理】除上面那一行外，再额外输出一行：",
+        'TREASURE:{"x":整数或null,"y":整数或null,"items":["英文名",...],"day":整数或null,"phase":"day或night"}',
+        f"地图 {turn.width}x{turn.height}，原点左下，西=x小 东=x大 南=y小 北=y大。",
+        f"物品英文名只能取自：{catalog}",
+        f"当前第{turn.day_no}天，上回合召唤结果码={turn.last_summon_result}。",
         "【民间传闻】",
         folk,
     ))

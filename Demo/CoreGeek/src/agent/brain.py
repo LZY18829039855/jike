@@ -6,30 +6,44 @@ from typing import Any
 from .grid import next_step
 from .intel import (
     MEM,
+    bad_build_cells,
     can_prompt,
     dump_ore,
     failed_cells,
+    force_submit_now,
     hold_ore,
     mark_prompt,
     mine_rank,
     missing_ritual,
+    note_attack,
+    note_summon_used,
     observe,
     parse_sandbox_answer,
     patch_task_answer,
     remember_answer,
     remember_commands,
     should_abandon_task,
+    summon_budget_left,
+    threat_anchor,
+    wall_zone_seeds,
+    weapon_ready,
+    weapon_zone_seeds,
     treasure_imminent,
     treasure_prompt,
     treasure_ready,
+    treasure_rider,
 )
 from .protocol import (
     BOMB,
+    BOSS_SUMMON,
     COPPER,
     DIZZY,
     IRON,
+    LARGE_SUMMON,
     MEDICINE,
+    MIDDLE_SUMMON,
     Pos,
+    SMALL_SUMMON,
     STATION_UPGRADE_1,
     STATION_UPGRADE_2,
     Turn,
@@ -50,6 +64,7 @@ from .protocol import (
     collect_command,
     distance,
     move_command,
+    remove_command,
     sell_command,
     station_footprint,
     submit_answer_command,
@@ -58,8 +73,9 @@ from .protocol import (
 )
 
 TOWER_LOADOUT = ("gatling", "railgun", "rocket")
-STONE_RESERVE = 4
-STONE_BATCH = 6
+STONE_RESERVE = 8
+STONE_BATCH = 10
+SUMMON_ORDERS = (BOSS_SUMMON, LARGE_SUMMON, MIDDLE_SUMMON, SMALL_SUMMON)
 _NEIGHBOUR_STEPS = (
     (-1, -1), (-1, 0), (-1, 1),
     (0, -1), (0, 1),
@@ -92,7 +108,7 @@ def _day(
     turn: Turn, commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
     sites = _tower_sites(turn)
-    order = _wall_order(turn)
+    order = _wall_order(turn, seal=_should_seal(turn))
     standing_towers = {unit.pos for unit in turn.weapons()}
     standing_walls = {unit.pos for unit in turn.walls()}
     occupied = turn.occupied_cells()
@@ -104,10 +120,17 @@ def _day(
             pos for pos in sites if pos not in standing_towers
         ][: 3 - len(standing_towers)]
     walls_missing = [pos for pos in order if pos not in standing_walls]
-    free_towers = [pos for pos in towers_missing if pos not in occupied]
-    free_walls = [pos for pos in walls_missing if pos not in occupied]
+    banned = bad_build_cells()
+    free_towers = [
+        pos for pos in towers_missing if pos not in occupied and pos not in banned
+    ]
+    free_walls = [
+        pos for pos in walls_missing if pos not in occupied and pos not in banned
+    ]
     budget = turn.gold
     claimed: set[Pos] = set()
+    # 合围完成（或已砌够）之前，把石头优先变成墙而不是去买券
+    wall_rush = _ring_progress(turn)[1] < 0.6 and len(standing_walls) < 16
 
     prompt, execute_cmd = _pioneer_day(
         turn, sites, free_towers, free_walls, claimed, commands,
@@ -125,10 +148,18 @@ def _day(
             claimed,
             commands,
             budget,
+            wall_rush,
         )
-        if role.unit_id not in commands:
+        if role.unit_id not in commands and not _holding_line(turn, role):
             _idle_work(turn, role, claimed, commands)
     return prompt, execute_cmd
+
+
+def _holding_line(turn: Turn, role: Unit) -> bool:
+    """入夜前已经站到塔边的角色不要再被支使去采矿。"""
+    if not turn.near_night:
+        return False
+    return any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons())
 
 
 def _worker_day(
@@ -140,6 +171,7 @@ def _worker_day(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
     budget: int,
+    wall_rush: bool,
 ) -> int:
     # 1) 紧急回血
     if role.health <= 80:
@@ -152,12 +184,20 @@ def _worker_day(
     if _try_use_upgrade(turn, role, commands):
         return budget
 
-    # 3) 夜间临近：回防塔位
+    # 2.5) 手里的召唤令立刻用掉，作用于对手下个夜晚
+    if _try_use_summon(role, commands):
+        return budget
+
+    # 3) 天亮后拆掉夜里封上的缺口，否则全队出不了门
+    if not turn.near_night and _open_gate(turn, role, claimed, commands):
+        return budget
+
+    # 4) 夜间临近：回防塔位
     if turn.near_night and turn.weapons():
         if _man_tower(turn, role, claimed, commands):
             return budget
 
-    # 4) 优先建满三塔（先就近可立刻建造的格子）
+    # 5) 优先建满三塔（先就近可立刻建造的格子）
     if towers_missing and budget >= WEAPON_BUILD_COST:
         candidates = [
             (index, site) for index, site in enumerate(sites)
@@ -184,35 +224,109 @@ def _worker_day(
                     return budget - WEAPON_BUILD_COST
                 return budget
 
-    # 5) 背包矿石：高价或背包紧时去卖
+    # 6) 背包矿石：高价或背包紧时去卖
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
         return budget
 
-    # 6) 买升级券 / 消耗品
+    # 7) 砌墙：合围完成前，免费的 1000 血比 20 金的 +500 血更值
+    # 手上有石头才抢在采购前动手，专程去找石头留到最后
+    if walls_missing and wall_rush and _wall_work(
+        turn, role, walls_missing, claimed, commands, hunt_stone=False,
+    ):
+        return budget
+
+    # 8) 买升级券 / 消耗品
     spent = _buy_or_walk(turn, role, claimed, commands, budget)
     if spent is not None:
         return budget - spent
 
-    # 7) 砌墙
-    if walls_missing:
-        stones = role.item_count(WALL_MATERIAL)
-        mine = _adjacent_mine(turn, role, WALL_MATERIAL)
-        if mine is not None and stones < STONE_BATCH:
-            commands[role.unit_id] = collect_command(mine)
-            claimed.add(mine)
-            return budget
-        if stones:
-            for site in walls_missing:
-                if site not in claimed:
-                    _build_or_walk(turn, role, site, WALL, claimed, commands)
-                    return budget
-        if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
-            return budget
+    if walls_missing and _wall_work(
+        turn, role, walls_missing, claimed, commands,
+    ):
+        return budget
 
-    # 8) 经济采集：铜/铁优先，保留少量石头
+    # 9) 经济采集：铜/铁优先，保留少量石头
     if _mine_economy(turn, role, claimed, commands, keep_stone=bool(walls_missing)):
         return budget
     return budget
+
+
+def _try_use_summon(role: Unit, commands: dict[int, dict[str, Any]]) -> bool:
+    if summon_budget_left() <= 0:
+        return False
+    for name in SUMMON_ORDERS:
+        if role.has_item(name):
+            commands[role.unit_id] = use_command(name)
+            note_summon_used()
+            return True
+    return False
+
+
+def _should_seal(turn: Turn) -> bool:
+    """墙已基本合围、且所有角色都退回基地一圈内，才把缺口砌死。"""
+    if not turn.near_night:
+        return False
+    station = turn.station()
+    if station is None:
+        return False
+    if _ring_progress(turn)[1] < 0.6:
+        return False
+    footprint = station_footprint(station.pos)
+    roles = turn.controllable()
+    if not roles:
+        return False
+    return all(_footprint_distance(role.pos, footprint) <= 2 for role in roles)
+
+
+def _open_gate(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    gate = _gate_cell(turn)
+    if gate is None:
+        return False
+    wall = next((unit for unit in turn.walls() if unit.pos == gate), None)
+    if wall is None:
+        return False
+    if role.pos != gate and distance(role.pos, gate) <= 1:
+        commands[role.unit_id] = remove_command(gate)
+        return True
+    step = _step_toward(turn, role, gate, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
+        return True
+    return False
+
+
+def _wall_work(
+    turn: Turn,
+    role: Unit,
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    hunt_stone: bool = True,
+) -> bool:
+    stones = role.item_count(WALL_MATERIAL)
+    mine = _adjacent_mine(turn, role, WALL_MATERIAL)
+    if mine is not None and stones < STONE_BATCH:
+        commands[role.unit_id] = collect_command(mine)
+        claimed.add(mine)
+        return True
+    if stones:
+        pool = [site for site in walls_missing if site not in claimed]
+        # 能立刻动手的格子优先，别为了「理想墙位」空跑一路
+        adjacent = [
+            site for site in pool
+            if site != role.pos and distance(role.pos, site) <= 1
+        ]
+        for site in adjacent or pool:
+            if _build_or_walk(turn, role, site, WALL, claimed, commands):
+                return True
+    if not hunt_stone:
+        return False
+    return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
 
 
 def _pioneer_day(
@@ -234,7 +348,11 @@ def _pioneer_day(
             return "", ""
 
     if turn.phase_task.strip():
-        if should_abandon_task(turn):
+        # 宝藏是全局唯一奖励且有开启窗口，只有它值得中断任务
+        grab_treasure = treasure_ready(turn) and treasure_imminent(turn)
+        if should_abandon_task(turn) or grab_treasure:
+            if grab_treasure and _hunt_treasure(turn, role, claimed, commands):
+                return "", ""
             if _leave_task(turn, role, claimed, commands):
                 return "", ""
         else:
@@ -243,6 +361,7 @@ def _pioneer_day(
                 return prompt, execute_cmd
             if _stay_on_task(turn, role, claimed, commands):
                 return "", ""
+            return "", ""
 
     prompt = _maybe_treasure_prompt(turn)
 
@@ -445,6 +564,14 @@ def _solve_task(
             commands[role.unit_id] = submit_answer_command(payload)
             return "", ""
 
+    # 快超时且一次都没交过：先交保底答案，部分通过率也算分
+    if force_submit_now(turn):
+        payload = patch_task_answer(_fallback_answer(turn), turn)
+        if payload:
+            remember_answer(payload)
+            commands[role.unit_id] = submit_answer_command(payload)
+            return "", ""
+
     result = turn.last_cmd_result.strip()
     if result and not MEM.awaiting_task:
         MEM.awaiting_task = True
@@ -458,6 +585,19 @@ def _solve_task(
         mark_prompt(turn)
         return _task_prompt(turn), ""
     return "", ""
+
+
+def _fallback_answer(turn: Turn) -> str:
+    for source in (
+        MEM.task_answer,
+        _extract_tag(turn.llm_resp, "ANSWER"),
+        parse_sandbox_answer(turn.last_cmd_result),
+    ):
+        if source and source.strip():
+            return source.strip()
+    if MEM.task_required:
+        return "{}"
+    return ""
 
 
 def _safe_cmd(cmd: str) -> str:
@@ -487,10 +627,13 @@ def _task_prompt(turn: Turn, sandbox: str = "") -> str:
         parts.append(f"【上轮沙盒输出】\n{sandbox}")
     if MEM.task_answer:
         parts.append(f"【上次提交】\n{MEM.task_answer}")
-    if folk:
-        parts.append(f"【民间传闻累计】\n{folk}")
     if turn.official_news:
         parts.append(f"【官方消息】\n{turn.official_news}")
+    rider = treasure_rider(turn)
+    if rider:
+        parts.append(rider)
+    elif folk:
+        parts.append(f"【民间传闻累计】\n{folk}")
     return "\n".join(parts)
 
 
@@ -516,7 +659,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> str:
     for role, _ in pairs:
         if role.unit_id in commands:
             continue
-        if role.health <= 60:
+        if role.health <= 100:
             med = role.find_item(MEDICINE)
             if med:
                 commands[role.unit_id] = use_command(med)
@@ -525,20 +668,36 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> str:
         if _try_combat_item(turn, role, commands):
             used_controllers.add(role.unit_id)
 
+    fired: set[int] = set()
     for role, tower in pairs:
         if role.unit_id in used_controllers or role.unit_id in commands:
             continue
-        if distance(role.pos, tower.pos) <= 1:
-            if tower.cooldown > 0:
-                continue
-            targets = _attack_targets(turn, tower)
-            if targets:
-                commands[tower.unit_id] = attack_command(role.unit_id, *targets)
+        if distance(role.pos, tower.pos) > 1:
+            step = _step_toward(turn, role, tower.pos, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+            continue
+
+        # 火箭有 3 回合冷却，冷却期改控身边任意一座就绪的塔
+        ready = [
+            unit for unit in turn.weapons()
+            if weapon_ready(turn, unit)
+            and unit.unit_id not in fired
+            and distance(role.pos, unit.pos) <= 1
+        ]
+        if not ready:
+            if _try_combat_item(turn, role, commands, relaxed=True):
                 used_controllers.add(role.unit_id)
             continue
-        step = _step_toward(turn, role, tower.pos, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
+        pick = next(
+            (unit for unit in ready if unit.unit_id == tower.unit_id), ready[0],
+        )
+        targets = _attack_targets(turn, pick)
+        if targets:
+            commands[pick.unit_id] = attack_command(role.unit_id, *targets)
+            note_attack(turn, pick)
+            fired.add(pick.unit_id)
+            used_controllers.add(role.unit_id)
     return prompt
 
 
@@ -568,7 +727,10 @@ def _assign_towers(
 
 
 def _try_combat_item(
-    turn: Turn, role: Unit, commands: dict[int, dict[str, Any]],
+    turn: Turn,
+    role: Unit,
+    commands: dict[int, dict[str, Any]],
+    relaxed: bool = False,
 ) -> bool:
     station = turn.station()
     if station is None:
@@ -577,7 +739,8 @@ def _try_combat_item(
         robot for robot in turn.hostile_robots()
         if not robot.dizzy and distance(station.pos, robot.pos) <= 12
     ]
-    if len(hostiles) < 3 and not any(
+    min_pack = 2 if relaxed else 3
+    if len(hostiles) < min_pack and not any(
         robot.kind in {"bossRobot", "largeRobot"} for robot in hostiles
     ):
         return False
@@ -586,11 +749,11 @@ def _try_combat_item(
     if cluster is None:
         return False
     center, count = cluster
-    if count < 2:
+    if count < (1 if relaxed else 2):
         return False
 
     bomb = role.find_item(BOMB)
-    if bomb and count >= 3:
+    if bomb and count >= (2 if relaxed else 3):
         commands[role.unit_id] = use_command(bomb, center)
         return True
     dizzy = role.find_item(DIZZY)
@@ -812,7 +975,8 @@ def _try_use_upgrade(
     if fixer:
         damaged = [
             wall for wall in turn.walls()
-            if wall.health < 600 and distance(role.pos, wall.pos) <= 1
+            if wall.health < _wall_max_hp(wall) * 4 // 5
+            and distance(role.pos, wall.pos) <= 1
         ]
         if damaged:
             wall = min(damaged, key=lambda unit: unit.health)
@@ -844,13 +1008,19 @@ def _try_use_upgrade(
     return False
 
 
+def _wall_max_hp(wall: Unit) -> int:
+    # level1/2/3 分别 1000/1500/2000
+    return 500 * (min(max(wall.level, 1), 3) + 1)
+
+
 def _should_sell(turn: Turn, role: Unit) -> bool:
     ores = role.ore_counts()
     if not ores:
         return False
     if role.backpack_full:
         return True
-    sellable = 0
+    # 按金币价值判断，避免为了 4 块 1 金的石头跑一趟小贩
+    value = 0
     for name, count in ores.items():
         if name == WALL_MATERIAL:
             count = max(0, count - STONE_RESERVE)
@@ -858,18 +1028,14 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
             continue
         if hold_ore(turn, name) and not dump_ore(turn, name):
             continue
-        sellable += count
         if dump_ore(turn, name):
             return True
-    if sellable >= 8:
+        value += count * turn.ore_price(name)
+    if value >= 30:
         return True
-    if ores.get(COPPER, 0) and turn.ore_price(COPPER) >= 5 and not hold_ore(turn, COPPER):
+    if len(turn.weapons()) < 3 and value >= WEAPON_BUILD_COST - turn.gold:
         return True
-    if ores.get(IRON, 0) and turn.ore_price(IRON) >= 4 and not hold_ore(turn, IRON):
-        return True
-    if turn.gold < WEAPON_BUILD_COST and sellable >= 3:
-        return True
-    if len(turn.weapons()) >= 3 and turn.gold < 100 and sellable >= 5:
+    if turn.gold < 20 and value >= 15:
         return True
     return False
 
@@ -944,57 +1110,90 @@ def _buy_or_walk(
 def _wanted_purchase(
     turn: Turn, role: Unit, budget: int,
 ) -> tuple[str, int] | None:
-    # 已有券则先别买重复的
+    """按「每金币换到的基地存活量」排序：围墙 25 > 基地 15 > 武器 5。"""
     weapons = turn.weapons()
+    walls = turn.walls()
     station = turn.station()
 
-    def can_buy(name: str) -> tuple[str, int] | None:
+    def can_buy(name: str, stack: int = 1) -> tuple[str, int] | None:
         price = turn.shop_price(name)
-        if budget >= price and not role.has_item(name):
+        if budget >= price and role.item_count(name) < stack:
             return name, price
         return None
 
-    if any(tower.level == 1 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_1)
+    # 1) 围墙升级：20 金 +500 血，性价比最高
+    if any(wall.level == 1 for wall in walls):
+        item = can_buy(WALL_UPGRADE_1)
         if item:
             return item
+    # 2) 基地血量直接决定胜负
     if station is not None and station.level == 1:
         item = can_buy(STATION_UPGRADE_1)
         if item:
             return item
-    if any(tower.level == 2 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_2)
+    if any(wall.level == 2 for wall in walls):
+        item = can_buy(WALL_UPGRADE_2)
         if item:
             return item
     if station is not None and station.level == 2:
         item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
-    if turn.day_no >= 3 and budget >= turn.shop_price(DIZZY):
-        item = can_buy(DIZZY)
+    # 3) 残墙先补血，比重建便宜
+    if any(wall.health * 5 < _wall_max_hp(wall) * 3 for wall in walls):
+        item = can_buy(WALL_FIXER, stack=2)
         if item:
             return item
-    if turn.day_no >= 4 and budget >= turn.shop_price(BOMB):
-        item = can_buy(BOMB)
+    # 4) 武器升级排在生存之后
+    if any(tower.level == 1 for tower in weapons):
+        item = can_buy(WEAPON_UPGRADE_1)
+        if item:
+            return item
+    if any(tower.level == 2 for tower in weapons):
+        item = can_buy(WEAPON_UPGRADE_2)
         if item:
             return item
     need = missing_ritual(turn, role)
-    if need and budget >= turn.shop_price(need[0]):
+    if need:
         item = can_buy(need[0])
         if item:
             return item
     if role.health < 150:
-        item = can_buy(MEDICINE)
+        item = can_buy(MEDICINE, stack=2)
         if item:
             return item
-    if any(wall.health < 700 for wall in turn.walls()):
-        item = can_buy(WALL_FIXER)
+    # 5) 炸弹 100 金在 3x3 内打 100 点，可以囤
+    if turn.day_no >= 3:
+        item = can_buy(BOMB, stack=2)
         if item:
             return item
-    if turn.walls() and budget >= turn.shop_price(WALL_UPGRADE_1) + 50:
-        item = can_buy(WALL_UPGRADE_1)
+    if turn.day_no >= 3:
+        item = can_buy(DIZZY, stack=1)
         if item:
             return item
+    # 6) 生存与升级都到位后，用余钱压对手：其基地被毁我方直接胜
+    order = _summon_pick(turn, budget)
+    if order is not None:
+        item = can_buy(order, stack=1)
+        if item:
+            return item
+    return None
+
+
+def _summon_pick(turn: Turn, budget: int) -> str | None:
+    if turn.day_no < 4 or summon_budget_left() <= 0:
+        return None
+    station = turn.station()
+    fully_upgraded = (
+        station is not None
+        and station.level >= 3
+        and all(tower.level >= 2 for tower in turn.weapons())
+    )
+    reserve = 60 if fully_upgraded else 220
+    spare = budget - reserve
+    for name in SUMMON_ORDERS:
+        if spare >= turn.shop_price(name):
+            return name
     return None
 
 
@@ -1091,6 +1290,8 @@ def _build_or_walk(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
+    if target in bad_build_cells():
+        return False
     if role.pos != target and distance(role.pos, target) <= 1:
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
@@ -1170,17 +1371,26 @@ def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
     station = turn.station()
     if station is None:
         return ()
-    footprint = station_footprint(station.pos)
+    banned = bad_build_cells()
+    seeds = weapon_zone_seeds()
+    anchor = threat_anchor(turn)
     cells = [
-        pos for pos in _cells_at_distance(station.pos, 1) if turn.land(pos)
+        pos for pos in _cells_at_distance(station.pos, 1)
+        if turn.land(pos) and pos not in banned
     ]
+    # 塔位朝机器人实际来向摆，射程才不浪费；已验证过的格子优先
     cells.sort(
-        key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y),
+        key=lambda pos: (
+            0 if pos in seeds else 1,
+            distance(pos, anchor),
+            pos.x,
+            pos.y,
+        ),
     )
     return tuple(cells[:3])
 
 
-def _wall_order(turn: Turn) -> tuple[Pos, ...]:
+def _wall_ring(turn: Turn) -> tuple[Pos, ...]:
     station = turn.station()
     if station is None:
         return ()
@@ -1189,14 +1399,70 @@ def _wall_order(turn: Turn) -> tuple[Pos, ...]:
     ys = [pos.y for pos in footprint]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    order = [
+    ring = [
         *(Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)),
         *(Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)),
         *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
         *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 2, -1)),
     ]
-    entrance = Pos(xmax + 2, ymin - 1)
-    return tuple(pos for pos in order if pos != entrance and turn.land(pos))
+    return tuple(pos for pos in ring if turn.land(pos))
+
+
+def _ring_progress(turn: Turn) -> tuple[tuple[Pos, ...], float]:
+    ring = _wall_ring(turn)
+    if not ring:
+        return (), 0.0
+    legal = [pos for pos in ring if pos not in bad_build_cells()]
+    if not legal:
+        return ring, 0.0
+    standing = {unit.pos for unit in turn.walls()}
+    built = sum(1 for pos in legal if pos in standing)
+    return ring, built / len(legal)
+
+
+def _gate_cell(turn: Turn) -> Pos | None:
+    """只有在环形墙基本合围时才需要留出入口。"""
+    ring, progress = _ring_progress(turn)
+    if not ring or progress < 0.6:
+        return None
+    anchor = threat_anchor(turn)
+    return max(ring, key=lambda pos: (distance(pos, anchor), pos.x, pos.y))
+
+
+def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
+    """接口不给黄色可建造区域，所以理想环形位与已知合法墙的邻格一起当候选。
+
+    环形位离基地最近、排在前面；一旦判定为非法就进黑名单，
+    候选自然退化成沿现有围墙向外生长，逐步逼近真实的黄色区域。
+    """
+    station = turn.station()
+    if station is None:
+        return ()
+    ring = _wall_ring(turn)
+    seeds = wall_zone_seeds()
+    frontier = {
+        pos for seed in seeds for pos in _neighbours(seed)
+        if turn.land(pos) and pos not in seeds
+    }
+    banned = bad_build_cells()
+    gate = None if seal else _gate_cell(turn)
+    anchor = threat_anchor(turn)
+    footprint = station_footprint(station.pos)
+
+    candidates = [
+        pos for pos in {*ring, *frontier}
+        if pos not in banned and pos != gate
+    ]
+    candidates.sort(
+        key=lambda pos: (
+            0 if pos in ring else 1,
+            distance(pos, anchor),
+            _footprint_distance(pos, footprint),
+            pos.x,
+            pos.y,
+        ),
+    )
+    return tuple(candidates[:40])
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:

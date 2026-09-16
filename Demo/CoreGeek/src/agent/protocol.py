@@ -108,6 +108,10 @@ DEFAULT_SHOP_PRICE = {
     MEDICINE: 10,
     DIZZY: 100,
     BOMB: 100,
+    SMALL_SUMMON: 20,
+    MIDDLE_SUMMON: 30,
+    LARGE_SUMMON: 100,
+    BOSS_SUMMON: 200,
 }
 
 
@@ -554,6 +558,10 @@ def use_command(name: str, target: Pos | None = None) -> dict[str, Any]:
     if target is not None:
         command["targetPos"] = [target.dump()]
     return command
+
+
+def remove_command(pos: Pos) -> dict[str, Any]:
+    return {"action": "remove", "targetPos": [pos.dump()]}
 
 
 def accept_task_command() -> dict[str, Any]:
