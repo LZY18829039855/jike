@@ -1,26 +1,27 @@
 from __future__ import annotations
 
-import re
 from itertools import permutations
 from typing import Any
 
 from .grid import next_step
+from .evolve import (
+    pick_task,
+    should_prioritize,
+    solve as solve_evolve_task,
+    treasure_may_interrupt,
+)
 from .intel import (
     MEM,
     bad_build_cells,
     can_prompt,
     dump_ore,
     failed_cells,
-    force_submit_now,
     hold_ore,
     mark_prompt,
     mine_rank,
     missing_ritual,
     note_summon_used,
     observe,
-    parse_sandbox_answer,
-    patch_task_answer,
-    remember_answer,
     remember_commands,
     remember_task_accept,
     should_abandon_task,
@@ -32,7 +33,6 @@ from .intel import (
     treasure_imminent,
     treasure_prompt,
     treasure_ready,
-    treasure_rider,
 )
 from .protocol import (
     BOMB,
@@ -68,7 +68,6 @@ from .protocol import (
     remove_command,
     sell_command,
     station_footprint,
-    submit_answer_command,
     summon_treasure_command,
     use_command,
 )
@@ -136,8 +135,6 @@ def _day(
     ]
     budget = turn.gold
     claimed: set[Pos] = set()
-    # 合围完成（或已砌够）之前，把石头优先变成墙而不是去买券
-    wall_rush = _ring_progress(turn)[1] < 0.6 and len(standing_walls) < 16
 
     prompt, execute_cmd = _pioneer_day(
         turn, sites, free_towers, free_walls, claimed, commands,
@@ -155,7 +152,6 @@ def _day(
             claimed,
             commands,
             budget,
-            wall_rush,
         )
         if role.unit_id not in commands and not _holding_line(turn, role):
             _idle_work(turn, role, claimed, commands)
@@ -178,7 +174,6 @@ def _worker_day(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
     budget: int,
-    wall_rush: bool,
 ) -> int:
     # 1) 紧急回血
     if role.health <= 80:
@@ -187,7 +182,7 @@ def _worker_day(
             commands[role.unit_id] = use_command(med)
             return budget
 
-    # 2) 使用已有升级券 / 修复包
+    # 2) 手里已有升级券优先用掉（尤其是武器升级券）
     if _try_use_upgrade(turn, role, commands):
         return budget
 
@@ -204,7 +199,13 @@ def _worker_day(
         if _man_tower(turn, role, claimed, commands):
             return budget
 
-    # 5) 优先建满三塔（先就近可立刻建造的格子）
+    # 5) 白天优先砌墙：石头免费换血量，先合围再花金币
+    if walls_missing and _wall_work(
+        turn, role, walls_missing, claimed, commands,
+    ):
+        return budget
+
+    # 6) 围墙进度够后再补塔
     if towers_missing and budget >= WEAPON_BUILD_COST:
         candidates = [
             (index, site) for index, site in enumerate(sites)
@@ -231,26 +232,14 @@ def _worker_day(
                     return budget - WEAPON_BUILD_COST
                 return budget
 
-    # 6) 背包矿石：高价或背包紧时去卖
+    # 7) 背包矿石：高价或背包紧时去卖，攒钱买武器升级券
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
         return budget
 
-    # 7) 砌墙：合围完成前，免费的 1000 血比 20 金的 +500 血更值
-    # 手上有石头才抢在采购前动手，专程去找石头留到最后
-    if walls_missing and wall_rush and _wall_work(
-        turn, role, walls_missing, claimed, commands, hunt_stone=False,
-    ):
-        return budget
-
-    # 8) 买升级券 / 消耗品
+    # 8) 买武器升级券等；买完由步骤 2 在后续回合使用
     spent = _buy_or_walk(turn, role, claimed, commands, budget)
     if spent is not None:
         return budget - spent
-
-    if walls_missing and _wall_work(
-        turn, role, walls_missing, claimed, commands,
-    ):
-        return budget
 
     # 9) 经济采集：铜/铁优先，保留少量石头
     if _mine_economy(turn, role, claimed, commands, keep_stone=bool(walls_missing)):
@@ -354,25 +343,35 @@ def _pioneer_day(
             commands[role.unit_id] = use_command(med)
             return "", ""
 
+    # —— 自进化任务最高优先：已接取则求解，可接取则前往领取 ——
     if turn.phase_task.strip():
-        # 宝藏是全局唯一奖励且有开启窗口，只有它值得中断任务
-        grab_treasure = (
-            MEM.task_submits > 0
-            and treasure_ready(turn)
-            and treasure_imminent(turn)
-        )
-        if should_abandon_task(turn) or grab_treasure:
-            if grab_treasure and _hunt_treasure(turn, role, claimed, commands):
+        if should_abandon_task(turn) or treasure_may_interrupt(turn):
+            if treasure_may_interrupt(turn) and _hunt_treasure(
+                turn, role, claimed, commands,
+            ):
                 return "", ""
             if _leave_task(turn, role, claimed, commands):
                 return "", ""
         else:
-            prompt, execute_cmd = _solve_task(turn, role, commands)
+            prompt, execute_cmd = solve_evolve_task(turn, role, commands)
+            # executeCmd 与角色指令独立；未交卷时务必停在任务点周围，否则任务会被强制结束
+            if role.unit_id not in commands:
+                _stay_on_task(turn, role, claimed, commands)
             if role.unit_id in commands or prompt or execute_cmd:
                 return prompt, execute_cmd
-            if _stay_on_task(turn, role, claimed, commands):
-                return "", ""
             return "", ""
+
+    if should_prioritize(turn):
+        task = pick_task(turn, role)
+        if task is not None:
+            if distance(role.pos, task.pos) <= 1:
+                commands[role.unit_id] = accept_task_command()
+                remember_task_accept(task, turn.round_no)
+                return "", ""
+            step = _step_toward(turn, role, task.pos, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+                return "", ""
 
     prompt = _maybe_treasure_prompt(turn)
 
@@ -387,42 +386,11 @@ def _pioneer_day(
     ):
         return prompt, ""
 
-    tasks = turn.available_tasks()
-    skip_task = turn.near_night or (
-        treasure_imminent(turn) and MEM.treasure.pos is not None
-    ) or turn.round_no < MEM.skip_task_until
-    if tasks and not skip_task:
-        task = max(tasks, key=lambda item: _task_value(turn, role, item))
-        if distance(role.pos, task.pos) <= 1:
-            commands[role.unit_id] = accept_task_command()
-            remember_task_accept(task, turn.round_no)
-            return prompt, ""
-        step = _step_toward(turn, role, task.pos, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
-            return prompt, ""
-
     if turn.weapons():
         _man_tower(turn, role, claimed, commands, prefer_inside=True)
     elif towers_missing:
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
     return prompt, ""
-
-
-def _task_value(turn: Turn, role: Unit, task) -> tuple[float, float, int]:
-    travel = max(0, distance(role.pos, task.pos) - 1)
-    timeout = task.timeout_rounds or 25
-    solve_rounds = min(12, max(4, timeout // 3))
-    elapsed = max(1, travel + solve_rounds)
-    speed_bonus = 5.0 * timeout / solve_rounds if task.timeout_rounds else 0.0
-    expected = task.score_reward + speed_bonus + task.gold_reward * 0.4
-    # 临近夜晚时额外惩罚长路任务，避免开拓者滞留野外。
-    night_penalty = max(0, turn.round_of_day + travel - 60) * 2
-    return (
-        (expected - night_penalty) / elapsed,
-        expected,
-        -travel,
-    )
 
 
 def _leave_task(
@@ -565,111 +533,7 @@ def _buy_named_or_walk(
 def _solve_task(
     turn: Turn, role: Unit, commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
-    resp = turn.llm_resp.strip()
-    if resp:
-        answer = _extract_tag(resp, "ANSWER")
-        if answer:
-            payload = patch_task_answer(answer, turn)
-            remember_answer(payload)
-            commands[role.unit_id] = submit_answer_command(payload)
-            return "", ""
-        cmd = _extract_tag(resp, "CMD")
-        if cmd:
-            MEM.awaiting_task = False
-            return "", _safe_cmd(cmd)
-
-    sandbox = parse_sandbox_answer(turn.last_cmd_result)
-    if sandbox:
-        payload = patch_task_answer(sandbox, turn)
-        remember_answer(payload)
-        commands[role.unit_id] = submit_answer_command(payload)
-        return "", ""
-
-    if MEM.task_fails and (MEM.task_required or MEM.task_forbidden) and MEM.task_answer:
-        payload = patch_task_answer(MEM.task_answer, turn)
-        if payload != MEM.task_answer:
-            remember_answer(payload)
-            commands[role.unit_id] = submit_answer_command(payload)
-            return "", ""
-
-    # 快超时且一次都没交过：先交保底答案，部分通过率也算分
-    if force_submit_now(turn):
-        payload = patch_task_answer(_fallback_answer(turn), turn)
-        if payload:
-            remember_answer(payload)
-            commands[role.unit_id] = submit_answer_command(payload)
-            return "", ""
-
-    result = turn.last_cmd_result.strip()
-    if result and not MEM.awaiting_task:
-        MEM.awaiting_task = True
-        MEM.prompted_task = turn.phase_task
-        mark_prompt(turn)
-        return _task_prompt(turn, sandbox=result), ""
-
-    if not MEM.awaiting_task:
-        MEM.prompted_task = turn.phase_task
-        MEM.awaiting_task = True
-        mark_prompt(turn)
-        return _task_prompt(turn), ""
-    return "", ""
-
-
-def _fallback_answer(turn: Turn) -> str:
-    for source in (
-        MEM.task_answer,
-        _extract_tag(turn.llm_resp, "ANSWER"),
-        parse_sandbox_answer(turn.last_cmd_result),
-    ):
-        if source and source.strip():
-            return source.strip()
-    if MEM.task_required:
-        return "{}"
-    return ""
-
-
-def _safe_cmd(cmd: str) -> str:
-    cmd = cmd.strip().strip("`")
-    if re.search(r"rm\s+-rf|shutdown|reboot|mkfs|dd\s+if=", cmd, re.I):
-        return "python3 -c \"print('')\""
-    return cmd[:2000]
-
-
-def _task_prompt(turn: Turn, sandbox: str = "") -> str:
-    folk = "\n".join(MEM.folk)
-    parts = [
-        "你是《未来战争》参赛 Agent 的任务求解器。沙盒无外网，可执行 shell 与 python。",
-        "若已得到最终答案，只输出一行：ANSWER:<最终答案，优先合法 JSON>",
-        "若还需在沙盒执行命令，只输出一行：CMD:<单条命令>",
-        "不要输出其它解释。JSON 必须不多不少，键名与任务要求完全一致。",
-        "",
-        f"【当前任务】\n{turn.phase_task}",
-    ]
-    if MEM.task_required:
-        parts.append("【必须包含的键】 " + ", ".join(MEM.task_required))
-    if MEM.task_forbidden:
-        parts.append("【禁止出现的键】 " + ", ".join(MEM.task_forbidden))
-    if turn.error_msgs:
-        parts.append("【上轮判题错误】\n" + "\n".join(turn.error_msgs))
-    if sandbox:
-        parts.append(f"【上轮沙盒输出】\n{sandbox}")
-    if MEM.task_answer:
-        parts.append(f"【上次提交】\n{MEM.task_answer}")
-    if turn.official_news:
-        parts.append(f"【官方消息】\n{turn.official_news}")
-    rider = treasure_rider(turn)
-    if rider:
-        parts.append(rider)
-    elif folk:
-        parts.append(f"【民间传闻累计】\n{folk}")
-    return "\n".join(parts)
-
-
-def _extract_tag(text: str, tag: str) -> str:
-    match = re.search(rf"{tag}\s*:\s*(.+)", text, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    return match.group(1).strip().strip("`").strip()
+    return solve_evolve_task(turn, role, commands)
 
 
 def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> str:
@@ -1135,7 +999,7 @@ def _buy_or_walk(
 def _wanted_purchase(
     turn: Turn, role: Unit, budget: int,
 ) -> tuple[str, int] | None:
-    """按「每金币换到的基地存活量」排序：围墙 25 > 基地 15 > 武器 5。"""
+    """白天购货顺序：基地保命 → 武器升级券 → 墙券/修复 → 其它。"""
     weapons = turn.weapons()
     walls = turn.walls()
     station = turn.station()
@@ -1151,17 +1015,20 @@ def _wanted_purchase(
         item = can_buy(STATION_UPGRADE_1)
         if item:
             return item
-    # 2) 再升级最可能承伤的墙。
-    if any(wall.level == 1 for wall in walls):
-        item = can_buy(WALL_UPGRADE_1)
-        if item:
-            return item
-    # 3) 武器升级同时增加火力、射程和血量。
+    # 2) 围墙建好后，金币优先买武器升级券并升级火力。
     if any(tower.level == 1 for tower in weapons):
         item = can_buy(WEAPON_UPGRADE_1)
         if item:
             return item
-    # 进入最高等级前再强化基地，避免所有钱耗在多面墙上。
+    if any(tower.level == 2 for tower in weapons):
+        item = can_buy(WEAPON_UPGRADE_2)
+        if item:
+            return item
+    # 3) 再升级围墙与基地。
+    if any(wall.level == 1 for wall in walls):
+        item = can_buy(WALL_UPGRADE_1)
+        if item:
+            return item
     if station is not None and station.level == 2:
         item = can_buy(STATION_UPGRADE_2)
         if item:
@@ -1173,10 +1040,6 @@ def _wanted_purchase(
     # 4) 残墙先补血，比重建便宜。
     if any(wall.health * 5 < _wall_max_hp(wall) * 3 for wall in walls):
         item = can_buy(WALL_FIXER, stack=2)
-        if item:
-            return item
-    if any(tower.level == 2 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_2)
         if item:
             return item
     need = missing_ritual(turn, role)

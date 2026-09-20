@@ -138,6 +138,12 @@ def reset_memory() -> None:
     MEM.last_round = 0
     MEM.match_signature = ()
     _clear_task()
+    try:
+        from .evolve import reset as reset_evolve
+
+        reset_evolve()
+    except Exception:
+        pass
 
 
 def observe(turn: Turn) -> None:
@@ -363,8 +369,17 @@ def _observe_task(turn: Turn) -> None:
             MEM.pending_task_pos = None
             MEM.pending_task_round = 0
         return
-    if MEM.prompted_task and MEM.prompted_task != task and MEM.task_started_round:
-        _clear_task()
+    # 同一接取内题目文本可能演进（自进化子题）；只重置求解态，保留超时起点。
+    if MEM.prompted_task and MEM.prompted_task != task:
+        MEM.task_answer = ""
+        MEM.awaiting_task = False
+        MEM.prompted_task = task
+        try:
+            from .evolve import on_task_text
+
+            on_task_text(task)
+        except Exception:
+            pass
     if MEM.task_started_round == 0:
         MEM.prompted_task = task
         if (

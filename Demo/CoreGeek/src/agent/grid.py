@@ -68,7 +68,15 @@ def _greedy_step(
         options.append((distance(step, goal), abs(dx) + abs(dy), step.x + step.y, step))
     if not options:
         return None
-    options.sort()
+    options.sort(
+        key=lambda option: (
+            option[0],
+            option[1],
+            option[2],
+            option[3].x,
+            option[3].y,
+        )
+    )
     best = options[0][3]
     if distance(best, goal) >= now and now <= 1:
         return None
