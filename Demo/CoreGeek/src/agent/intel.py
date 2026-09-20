@@ -410,9 +410,17 @@ def _observe_task(turn: Turn) -> None:
         _ingest_schema_error(msg)
         if code in {1, 2}:
             MEM.task_fails += 1
-        # 答案错误后需要重新问一次 LLM，别停在等待态
+        # 答案错误后需要重新问一次 LLM，别停在等待态；清掉错误答案防反复提交
         if code == 2:
             MEM.awaiting_task = False
+            if MEM.task_answer:
+                try:
+                    from .evolve import is_junk_answer
+
+                    if is_junk_answer(MEM.task_answer):
+                        MEM.task_answer = ""
+                except Exception:
+                    MEM.task_answer = ""
     # 任务超时即已结束，此后留在任务点没有意义
     if 1 in turn.errors or task_rounds_left(turn) <= 0:
         MEM.abandon_task = True
@@ -557,28 +565,39 @@ def upcoming_hot_ore(turn: Turn) -> str | None:
 
 
 def mine_rank(turn: Turn, keep_stone: bool) -> list[str]:
+    """工人采金顺序：涨价矿 > 铜 > 铁；石头只为砌墙，不进金币主线。"""
     hot = upcoming_hot_ore(turn)
-    scored: list[tuple[int, str]] = []
+    scored: list[tuple[int, int, str]] = []
     for ore in (COPPER, IRON, WALL_MATERIAL):
         if mine_blocked(turn, ore):
             continue
+        # 基础档：铜 > 铁 > 石
+        tier = 3 if ore == COPPER else 2 if ore == IRON else 0
         score = turn.ore_price(ore) * 10
         if hot == ore:
-            score += 80
+            score += 100
+            tier = 4
         if dump_ore(turn, ore) and not hold_ore(turn, ore):
-            score += 15
+            score += 40
+            tier = max(tier, 4)
         if any(
             event.ore == ore
             and event.kind == "surplus"
             and event.start_day <= turn.day_no <= event.end_day
             for event in MEM.events
         ):
-            score -= 80
-        if keep_stone and ore == WALL_MATERIAL:
-            score += 40
-        scored.append((score, ore))
+            score -= 100
+            tier = min(tier, 1)
+        if ore == WALL_MATERIAL:
+            # 石头不参与卖金主线；仅在仍需砌墙时作为保底去采
+            if keep_stone:
+                score = 1
+                tier = 0
+            else:
+                continue
+        scored.append((tier, score, ore))
     scored.sort(reverse=True)
-    return [ore for _, ore in scored]
+    return [ore for _, _, ore in scored]
 
 
 def treasure_ready(turn: Turn) -> bool:

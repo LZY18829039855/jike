@@ -72,8 +72,8 @@ from .protocol import (
     use_command,
 )
 
-TOWER_LOADOUT = ("gatling", "railgun", "rocket")
-STONE_RESERVE = 8
+TOWER_LOADOUT = ("rocket", "rocket", "rocket")
+STONE_RESERVE = 12
 STONE_BATCH = 10
 SUMMON_ORDERS = (BOSS_SUMMON, LARGE_SUMMON, MIDDLE_SUMMON, SMALL_SUMMON)
 ROBOT_ATTACK = {
@@ -98,7 +98,7 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
     if turn.is_day:
         prompt, execute_cmd = _day(turn, commands)
     else:
-        prompt = _night(turn, commands)
+        prompt, execute_cmd = _night(turn, commands)
     remember_commands(commands)
     return {
         "roleCommandMap": {
@@ -199,13 +199,7 @@ def _worker_day(
         if _man_tower(turn, role, claimed, commands):
             return budget
 
-    # 5) 白天优先砌墙：石头免费换血量，先合围再花金币
-    if walls_missing and _wall_work(
-        turn, role, walls_missing, claimed, commands,
-    ):
-        return budget
-
-    # 6) 围墙进度够后再补塔
+    # 5) 开局并行：先凑满 3 座火箭炮，避免整晚无火力
     if towers_missing and budget >= WEAPON_BUILD_COST:
         candidates = [
             (index, site) for index, site in enumerate(sites)
@@ -226,13 +220,19 @@ def _worker_day(
                 ),
             )
             if _build_or_walk(
-                turn, role, site, TOWER_LOADOUT[index], claimed, commands,
+                turn, role, site, TOWER_LOADOUT[min(index, 2)], claimed, commands,
             ):
                 if distance(role.pos, site) <= 1 and role.pos != site:
                     return budget - WEAPON_BUILD_COST
                 return budget
 
-    # 7) 背包矿石：高价或背包紧时去卖，攒钱买武器升级券
+    # 6) 白天砌墙：石头免费换血量
+    if walls_missing and _wall_work(
+        turn, role, walls_missing, claimed, commands,
+    ):
+        return budget
+
+    # 7) 有铜/铁/涨价矿就尽快卖掉换成金币
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
         return budget
 
@@ -241,7 +241,7 @@ def _worker_day(
     if spent is not None:
         return budget - spent
 
-    # 9) 经济采集：铜/铁优先，保留少量石头
+    # 9) 经济采集：涨价矿 > 铜 > 铁；石头只在仍缺墙时保底
     if _mine_economy(turn, role, claimed, commands, keep_stone=bool(walls_missing)):
         return budget
     return budget
@@ -343,7 +343,7 @@ def _pioneer_day(
             commands[role.unit_id] = use_command(med)
             return "", ""
 
-    # —— 自进化任务最高优先：已接取则求解，可接取则前往领取 ——
+    # —— 开拓者金币主线：能开宝藏就开；否则刷任务点 ——
     if turn.phase_task.strip():
         if should_abandon_task(turn) or treasure_may_interrupt(turn):
             if treasure_may_interrupt(turn) and _hunt_treasure(
@@ -361,23 +361,35 @@ def _pioneer_day(
                 return prompt, execute_cmd
             return "", ""
 
+    prompt = _maybe_treasure_prompt(turn)
+
+    # 条件齐全就开宝藏（积分/金币大头）
+    if _hunt_treasure(turn, role, claimed, commands):
+        return prompt, ""
+
+    # 宝藏将开但缺祭品：先去买齐
+    if (
+        turn.weapons()
+        and not turn.near_night
+        and treasure_imminent(turn)
+        and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
+    ):
+        return prompt, ""
+
+    # 否则刷任务点换金币/积分
     if should_prioritize(turn):
         task = pick_task(turn, role)
         if task is not None:
             if distance(role.pos, task.pos) <= 1:
                 commands[role.unit_id] = accept_task_command()
                 remember_task_accept(task, turn.round_no)
-                return "", ""
+                return prompt, ""
             step = _step_toward(turn, role, task.pos, claimed)
             if step is not None:
                 commands[role.unit_id] = move_command(step)
-                return "", ""
+                return prompt, ""
 
-    prompt = _maybe_treasure_prompt(turn)
-
-    if _hunt_treasure(turn, role, claimed, commands):
-        return prompt, ""
-
+    # 非紧急时也可慢慢备齐祭品
     if (
         turn.weapons()
         and not turn.near_night
@@ -536,14 +548,42 @@ def _solve_task(
     return solve_evolve_task(turn, role, commands)
 
 
-def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> str:
+def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     claimed: set[Pos] = set()
     used_controllers: set[int] = set()
     prompt = ""
+    execute_cmd = ""
     pioneer = turn.pioneer()
-    if pioneer is not None and treasure_ready(turn) and MEM.treasure.phase == "night":
+
+    # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点
+    if pioneer is not None and turn.phase_task.strip():
+        if should_abandon_task(turn):
+            if _leave_task(turn, pioneer, claimed, commands):
+                used_controllers.add(pioneer.unit_id)
+        elif treasure_may_interrupt(turn) and MEM.treasure.phase == "night":
+            if _hunt_treasure(turn, pioneer, claimed, commands):
+                used_controllers.add(pioneer.unit_id)
+        else:
+            prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
+            if pioneer.unit_id not in commands:
+                _stay_on_task(turn, pioneer, claimed, commands)
+            if pioneer.unit_id in commands or prompt or execute_cmd:
+                used_controllers.add(pioneer.unit_id)
+    elif pioneer is not None and treasure_ready(turn) and MEM.treasure.phase == "night":
         if _hunt_treasure(turn, pioneer, claimed, commands):
             used_controllers.add(pioneer.unit_id)
+    elif pioneer is not None and should_prioritize(turn):
+        task = pick_task(turn, pioneer)
+        if task is not None:
+            if distance(pioneer.pos, task.pos) <= 1:
+                commands[pioneer.unit_id] = accept_task_command()
+                remember_task_accept(task, turn.round_no)
+                used_controllers.add(pioneer.unit_id)
+            else:
+                step = _step_toward(turn, pioneer, task.pos, claimed)
+                if step is not None:
+                    commands[pioneer.unit_id] = move_command(step)
+                    used_controllers.add(pioneer.unit_id)
     else:
         prompt = _maybe_treasure_prompt(turn)
 
@@ -589,7 +629,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> str:
             commands[pick.unit_id] = attack_command(role.unit_id, *targets)
             fired.add(pick.unit_id)
             used_controllers.add(role.unit_id)
-    return prompt
+    return prompt, execute_cmd
 
 
 def _assign_towers(
@@ -908,11 +948,11 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
         return False
     if role.backpack_full:
         return True
-    # 按金币价值判断，避免为了 4 块 1 金的石头跑一趟小贩
+    # 只把铜/铁当卖金钱；石头默认留着建墙
     value = 0
     for name, count in ores.items():
         if name == WALL_MATERIAL:
-            count = max(0, count - STONE_RESERVE)
+            continue
         if count <= 0:
             continue
         if hold_ore(turn, name) and not dump_ore(turn, name):
@@ -920,11 +960,12 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
         if dump_ore(turn, name):
             return True
         value += count * turn.ore_price(name)
-    if value >= 30:
+    # 尽量勤卖：有涨价货立刻卖；铜铁积到约一趟小贩就出手
+    if value >= 15:
         return True
-    if len(turn.weapons()) < 3 and value >= WEAPON_BUILD_COST - turn.gold:
+    if len(turn.weapons()) < 3 and value >= max(5, WEAPON_BUILD_COST - turn.gold):
         return True
-    if turn.gold < 20 and value >= 15:
+    if turn.gold < 100 and value >= 10:
         return True
     return False
 
@@ -941,20 +982,28 @@ def _sell_or_walk(
     ores = role.ore_counts()
     if not ores:
         return False
-    # 保留砌墙用石头
+    # 卖货顺序：涨价矿 > 铜 > 铁；石头仅在背包满且没有铜铁时才卖超额部分
     sell_name = None
     sell_num = 0
-    best_key = (-1, -1)
+    best_key = (-1, -1, -1)
     for name in (COPPER, IRON, WALL_MATERIAL):
         count = ores.get(name, 0)
         if name == WALL_MATERIAL:
+            if not role.backpack_full:
+                continue
+            # 满包时仍尽量留砌墙库存
             count = max(0, count - STONE_RESERVE)
+            if ores.get(COPPER, 0) > 0 or ores.get(IRON, 0) > 0:
+                continue
         if count <= 0:
             continue
         if hold_ore(turn, name) and not role.backpack_full:
             continue
         price = turn.ore_price(name)
-        key = (1 if dump_ore(turn, name) else 0, price)
+        hot = 1 if dump_ore(turn, name) else 0
+        # 铜优先于铁（同价/非涨价时）
+        kind_rank = 2 if name == COPPER else 1 if name == IRON else 0
+        key = (hot, price, kind_rank)
         if key > best_key:
             best_key = key
             sell_name = name
