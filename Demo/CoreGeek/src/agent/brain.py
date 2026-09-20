@@ -357,6 +357,9 @@ def _pioneer_day(
             # executeCmd 与角色指令独立；未交卷时务必停在任务点周围，否则任务会被强制结束
             if role.unit_id not in commands:
                 _stay_on_task(turn, role, claimed, commands)
+            # 漏洞修复：禁止开拓者连续空指令（敌方同场无此问题）
+            if role.unit_id not in commands and not execute_cmd:
+                _hold_near_task(turn, role, claimed, commands)
             if role.unit_id in commands or prompt or execute_cmd:
                 return prompt, execute_cmd
             return "", ""
@@ -376,18 +379,10 @@ def _pioneer_day(
     ):
         return prompt, ""
 
-    # 否则刷任务点换金币/积分
+    # 否则刷任务点换金币/积分（冷却期也持续 accept，敌方同款）
     if should_prioritize(turn):
-        task = pick_task(turn, role)
-        if task is not None:
-            if distance(role.pos, task.pos) <= 1:
-                commands[role.unit_id] = accept_task_command()
-                remember_task_accept(task, turn.round_no)
-                return prompt, ""
-            step = _step_toward(turn, role, task.pos, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
-                return prompt, ""
+        if _accept_or_approach(turn, role, claimed, commands):
+            return prompt, ""
 
     # 非紧急时也可慢慢备齐祭品
     if (
@@ -403,6 +398,43 @@ def _pioneer_day(
     elif towers_missing:
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
     return prompt, ""
+
+
+def _accept_or_approach(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """有就绪任务就接；否则贴着任务点刷 accept（冷却无效也刷）。"""
+    task = pick_task(turn, role)
+    if task is not None:
+        if distance(role.pos, task.pos) <= 1:
+            commands[role.unit_id] = accept_task_command()
+            remember_task_accept(task, turn.round_no)
+            return True
+        step = _step_toward(turn, role, task.pos, claimed)
+        if step is not None:
+            commands[role.unit_id] = move_command(step)
+            return True
+        return False
+
+    points = list(turn.our_task_points()) or [item.pos for item in turn.tasks if item.valid]
+    if not points:
+        return False
+    nearest = min(points, key=lambda pos: distance(role.pos, pos))
+    if distance(role.pos, nearest) <= 1:
+        commands[role.unit_id] = accept_task_command()
+        for item in turn.tasks:
+            if item.pos == nearest:
+                remember_task_accept(item, turn.round_no)
+                break
+        return True
+    step = _step_toward(turn, role, nearest, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
+        return True
+    return False
 
 
 def _leave_task(
@@ -455,6 +487,34 @@ def _stay_on_task(
     nearest = min(points, key=lambda pos: distance(role.pos, pos))
     if distance(role.pos, nearest) <= 1:
         return False
+    step = _step_toward(turn, role, nearest, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
+        return True
+    return False
+
+
+def _hold_near_task(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """已在任务点旁但仍无指令时，绕点走动占位，避免 roleCommandMap 缺开拓者。"""
+    points = turn.our_task_points() or tuple(task.pos for task in turn.tasks)
+    if not points:
+        return False
+    nearest = min(points, key=lambda pos: distance(role.pos, pos))
+    for dx, dy in _NEIGHBOUR_STEPS:
+        pos = Pos(nearest.x + dx, nearest.y + dy)
+        if pos == role.pos or pos in claimed:
+            continue
+        if not turn.land(pos):
+            continue
+        if distance(role.pos, pos) <= 1:
+            commands[role.unit_id] = move_command(pos)
+            claimed.add(pos)
+            return True
     step = _step_toward(turn, role, nearest, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
@@ -555,7 +615,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     execute_cmd = ""
     pioneer = turn.pioneer()
 
-    # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点
+    # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点；再否则当炮手
     if pioneer is not None and turn.phase_task.strip():
         if should_abandon_task(turn):
             if _leave_task(turn, pioneer, claimed, commands):
@@ -567,25 +627,28 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
             if pioneer.unit_id not in commands:
                 _stay_on_task(turn, pioneer, claimed, commands)
+            if pioneer.unit_id not in commands and not execute_cmd:
+                _hold_near_task(turn, pioneer, claimed, commands)
             if pioneer.unit_id in commands or prompt or execute_cmd:
                 used_controllers.add(pioneer.unit_id)
     elif pioneer is not None and treasure_ready(turn) and MEM.treasure.phase == "night":
         if _hunt_treasure(turn, pioneer, claimed, commands):
             used_controllers.add(pioneer.unit_id)
     elif pioneer is not None and should_prioritize(turn):
-        task = pick_task(turn, pioneer)
-        if task is not None:
-            if distance(pioneer.pos, task.pos) <= 1:
-                commands[pioneer.unit_id] = accept_task_command()
-                remember_task_accept(task, turn.round_no)
-                used_controllers.add(pioneer.unit_id)
-            else:
-                step = _step_toward(turn, pioneer, task.pos, claimed)
-                if step is not None:
-                    commands[pioneer.unit_id] = move_command(step)
-                    used_controllers.add(pioneer.unit_id)
+        if _accept_or_approach(turn, pioneer, claimed, commands):
+            used_controllers.add(pioneer.unit_id)
     else:
         prompt = _maybe_treasure_prompt(turn)
+
+    # 无任务时开拓者专职炮手（敌方日志 gunner=10011）
+    if (
+        pioneer is not None
+        and pioneer.unit_id not in used_controllers
+        and pioneer.unit_id not in commands
+        and turn.weapons()
+    ):
+        if _man_tower(turn, pioneer, claimed, commands):
+            used_controllers.add(pioneer.unit_id)
 
     pairs = _assign_towers(turn, used_controllers)
     for role, _ in pairs:
@@ -949,6 +1012,17 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
     if role.backpack_full:
         return True
     # 只把铜/铁当卖金钱；石头默认留着建墙
+    copper = ores.get(COPPER, 0)
+    iron = ores.get(IRON, 0)
+    # 敌方同款：铜铁积到就整包大额卖，阈值尽量低
+    if copper > 0 or iron > 0:
+        value = copper * turn.ore_price(COPPER) + iron * turn.ore_price(IRON)
+        if dump_ore(turn, COPPER) or dump_ore(turn, IRON):
+            return True
+        if value >= 5:
+            return True
+        if turn.gold < WEAPON_BUILD_COST and value >= 1:
+            return True
     value = 0
     for name, count in ores.items():
         if name == WALL_MATERIAL:
@@ -960,7 +1034,6 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
         if dump_ore(turn, name):
             return True
         value += count * turn.ore_price(name)
-    # 尽量勤卖：有涨价货立刻卖；铜铁积到约一趟小贩就出手
     if value >= 15:
         return True
     if len(turn.weapons()) < 3 and value >= max(5, WEAPON_BUILD_COST - turn.gold):
@@ -1086,8 +1159,8 @@ def _wanted_purchase(
         item = can_buy(WALL_UPGRADE_2)
         if item:
             return item
-    # 4) 残墙先补血，比重建便宜。
-    if any(wall.health * 5 < _wall_max_hp(wall) * 3 for wall in walls):
+    # 4) 残墙先补血，比重建便宜（阈值放宽，尽早买 WallFixer）
+    if any(wall.health * 5 < _wall_max_hp(wall) * 4 for wall in walls):
         item = can_buy(WALL_FIXER, stack=2)
         if item:
             return item

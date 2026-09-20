@@ -15,6 +15,7 @@ from .intel import (
     patch_task_answer,
     remember_answer,
     task_rounds_left,
+    task_rounds_used,
     treasure_imminent,
     treasure_ready,
     treasure_rider,
@@ -132,6 +133,13 @@ _CITY_ALIASES = {
     "guangzhou": "广州", "wuhan": "武汉", "chongqing": "重庆", "shenzhen": "深圳",
 }
 _LEARNED_CITIES: dict[str, dict[str, Any]] = {}
+# 敌方日志里 token 题干不一定含 token/令牌；认证/auth/裸 12 位 hex 也要交
+_TOKEN_HINT = re.compile(
+    r"token|令牌|口令|认证码?|auth(?:entication|code)?|secret|passwd|"
+    r"password|密钥|验证码|口令码|\bkey\b|凭证|校验码",
+    re.I,
+)
+_HEX12 = re.compile(r"\b([a-fA-F0-9]{12})\b")
 
 
 @dataclass
@@ -204,14 +212,21 @@ def task_family(text: str) -> str:
 
 
 def should_prioritize(turn: Turn) -> bool:
-    """能接/能做自进化任务时优先去做（白天临近入夜除外，夜间可持续刷）。"""
+    """能接/能做自进化任务时优先去做（白天临近入夜除外，夜间可持续刷）。
+
+    敌方同款：冷却期也持续刷 accept，不因 skip/无就绪任务而长时间放弃。
+    """
     if turn.phase_task.strip():
         return True
-    if turn.round_no < MEM.skip_task_until:
-        return False
     if turn.is_day and turn.near_night:
         return False
-    return bool(turn.available_tasks())
+    # 有就绪任务 → 立刻去；否则仍去任务点刷 accept（冷却期无效也刷）
+    if turn.available_tasks():
+        return True
+    if turn.round_no < MEM.skip_task_until:
+        # 刚超时后短暂冷却，但仍允许靠近任务点刷 accept
+        return bool(turn.our_task_points() or turn.tasks)
+    return bool(turn.our_task_points() or turn.tasks)
 
 
 def pick_task(turn: Turn, role: Unit) -> PlayerTask | None:
@@ -286,9 +301,9 @@ def solve(
         skill.sandbox_notes = _STATE.last_sandbox[-1200:]
         concrete = concrete_sandbox_answer(raw_result)
         if not concrete:
-            # token 题：从沙盒全文抽十六进制
+            # token：沙盒抽出 hex 即交，不再要求题干含 token/令牌（敌方同款）
             token = _extract_token(raw_result)
-            if token and ("token" in task.lower() or "令牌" in task or "口令" in task):
+            if token and (_is_token_context(task) or _HEX12.search(raw_result)):
                 concrete = json.dumps(
                     {"token": token}, ensure_ascii=False, separators=(",", ":"),
                 )
@@ -344,6 +359,24 @@ def solve(
         mark_prompt(turn)
         return build_prompt(turn, skill), ""
 
+    # 8) 等待 LLM 时空转修复：再扫预设 / 再探沙盒 / 周期性重问，禁止空回合
+    retry_preset = try_preset_answer(task, skill)
+    if retry_preset and not is_junk_answer(retry_preset):
+        payload = patch_task_answer(retry_preset, turn)
+        _commit_answer(role, commands, payload, skill)
+        _learn_from_answer(payload)
+        return "", ""
+    boot = next_bootstrap_cmd(task, skill)
+    if boot:
+        _STATE.last_cmd = boot
+        if boot not in skill.explore_cmds:
+            skill.explore_cmds.append(boot)
+        MEM.awaiting_task = False
+        return "", boot
+    used = task_rounds_used(turn)
+    if used > 0 and used % 4 == 0:
+        mark_prompt(turn)
+        return build_prompt(turn, skill), ""
     return "", ""
 
 
@@ -353,7 +386,7 @@ def next_bootstrap_cmd(task: str, skill: Skill) -> str | None:
     low = task.lower()
 
     # token 题：优先在题目点名文件和常见位置搜十六进制
-    if "token" in low or "令牌" in task or "口令" in task:
+    if _is_token_context(task):
         steps.append(
             "python3 - <<'PY'\n"
             "import re, pathlib\n"
@@ -425,8 +458,8 @@ def try_preset_answer(task: str, skill: Skill) -> str:
         if isinstance(data, dict) and data:
             return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
-    # 2) token 题：题目文本自带 token
-    if re.search(r"token|令牌|口令", task, re.I):
+    # 2) token 题：题干自带 hex（关键词放宽；裸 12 位也交）
+    if _is_token_context(task):
         token = _extract_token(task)
         if token:
             return json.dumps(
@@ -455,6 +488,23 @@ def try_preset_answer(task: str, skill: Skill) -> str:
     return ""
 
 
+def _is_token_context(task: str) -> bool:
+    """是否应按 token 题处理（敌方日志：不一定出现 token 字样）。"""
+    if not task or not task.strip():
+        return False
+    if _TOKEN_HINT.search(task):
+        return True
+    # 短题干里单独出现 12 位 hex，且不像城市文物题
+    if _HEX12.search(task):
+        if _detect_city(task):
+            return False
+        low = task.lower()
+        if "文物" in task or "heritage" in low or "total_count" in low:
+            return False
+        return True
+    return False
+
+
 def _detect_city(task: str) -> str | None:
     for city in _CITY_HERITAGE:
         if city in task:
@@ -477,8 +527,10 @@ def _extract_token(text: str) -> str:
     if not text:
         return ""
     patterns = (
-        r'["\']?token["\']?\s*[:=]\s*["\']([a-fA-F0-9]{8,32})["\']',
-        r"token\s*[:=]\s*([a-fA-F0-9]{8,32})",
+        r'["\']?(?:token|auth|secret|key|令牌|口令|认证码?|密钥|验证码)'
+        r'["\']?\s*[:=：]\s*["\']([a-fA-F0-9]{8,32})["\']',
+        r"(?:token|auth|secret|令牌|口令|认证码?|密钥|验证码)"
+        r"\s*[:=：]\s*([a-fA-F0-9]{8,32})",
         r"ANSWER\s*:\s*([a-fA-F0-9]{8,32})",
         r"\b([a-fA-F0-9]{12})\b",
         r"\b([a-fA-F0-9]{16})\b",
@@ -488,6 +540,10 @@ def _extract_token(text: str) -> str:
         match = re.search(pat, text, re.I)
         if match:
             return match.group(1).lower()
+    # 兜底：全文第一个 12 位 hex
+    match = _HEX12.search(text)
+    if match:
+        return match.group(1).lower()
     return ""
 
 

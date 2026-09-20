@@ -424,8 +424,9 @@ def _observe_task(turn: Turn) -> None:
     # 任务超时即已结束，此后留在任务点没有意义
     if 1 in turn.errors or task_rounds_left(turn) <= 0:
         MEM.abandon_task = True
+        # 短暂跳过即可；敌方超时后仍持续刷 accept，不宜锁 30 回合
         if MEM.skip_task_until < turn.round_no:
-            MEM.skip_task_until = turn.round_no + 30
+            MEM.skip_task_until = turn.round_no + 5
 
 
 def remember_task_accept(task: PlayerTask, round_no: int) -> None:

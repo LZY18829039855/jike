@@ -29,6 +29,11 @@ assert task_family("查询北京天气，见 API_DOCS.md") == task_family(
 skill = Skill(family="t")
 token_ans = try_preset_answer('请提交 token=fc1e78eb2a5a', skill)
 assert '"token"' in token_ans and "fc1e78eb2a5a" in token_ans
+# 放宽：认证码 / 裸 12 位 hex（敌方同款题干）
+auth_ans = try_preset_answer("请提交认证码 0de1b57493cf", skill)
+assert "0de1b57493cf" in auth_ans and '"token"' in auth_ans
+bare_ans = try_preset_answer("提交以下字符串完成校验：c8be2288b213", skill)
+assert "c8be2288b213" in bare_ans
 city_ans = try_preset_answer("查询北京世界遗产与文物统计", skill)
 assert "周口店遗址" in city_ans and "total_count" in city_ans
 
@@ -58,6 +63,19 @@ assert "南京" in cmd.get("taskAnswer", ""), cmd
 assert out["executeCmd"] == ""
 assert out["prompt"] == ""
 
+# token 题（认证码，无 token 关键字）：立刻 submit，无 LLM/沙盒
+reset_memory()
+reset()
+payload["phaseTask"] = "请提交认证码 fc1e78eb2a5a"
+payload["llmResp"] = ""
+payload["lastCmdResult"] = ""
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert cmd.get("action") == "submitAnswer", out
+assert "fc1e78eb2a5a" in cmd.get("taskAnswer", ""), cmd
+assert out["executeCmd"] == ""
+assert out["prompt"] == ""
+
 # 垃圾 LLM 答案不得直接提交
 reset_memory()
 reset()
@@ -68,6 +86,8 @@ out = decide(payload)
 action = (out["roleCommandMap"].get("10011") or {}).get("action")
 answer = (out["roleCommandMap"].get("10011") or {}).get("taskAnswer", "")
 assert action != "submitAnswer" or not is_junk_answer(answer), out
+# 求解中开拓者不得从指令表消失
+assert "10011" in out["roleCommandMap"] or 10011 in out["roleCommandMap"] or out["executeCmd"] or out["prompt"], out
 
 # 开局工人应优先去建火箭炮（金币足够时）
 reset_memory()
