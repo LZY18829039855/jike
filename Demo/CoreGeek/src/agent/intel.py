@@ -419,14 +419,7 @@ def _observe_task(turn: Turn) -> None:
         # 答案错误后需要重新问一次 LLM，别停在等待态；清掉错误答案防反复提交
         if code == 2:
             MEM.awaiting_task = False
-            if MEM.task_answer:
-                try:
-                    from .evolve import is_junk_answer
-
-                    if is_junk_answer(MEM.task_answer):
-                        MEM.task_answer = ""
-                except Exception:
-                    MEM.task_answer = ""
+            MEM.task_answer = ""
     # 任务超时即已结束，此后留在任务点没有意义
     if 1 in turn.errors or task_rounds_left(turn) <= 0:
         MEM.abandon_task = True
@@ -521,9 +514,9 @@ def _default_field(key: str, blob: str, turn: Turn) -> Any:
         nums = re.findall(r"\d+", turn.last_cmd_result or blob)
         return int(nums[-1]) if nums else 0
     if key.lower() == "token":
-        if blob and not blob.startswith("{"):
-            return blob
-        return _extract_tag(turn.llm_resp, "ANSWER") or blob[:80]
+        if blob and not blob.startswith("{") and re.fullmatch(r"[a-fA-F0-9]{12,32}", blob.strip()):
+            return blob.strip().lower()
+        return ""
     return ""
 
 

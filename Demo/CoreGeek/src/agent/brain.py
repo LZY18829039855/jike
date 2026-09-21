@@ -403,8 +403,8 @@ def _pioneer_day(
             # executeCmd 与角色指令独立；未交卷时务必停在任务点周围，否则任务会被强制结束
             if role.unit_id not in commands:
                 _stay_on_task(turn, role, claimed, commands)
-            # 漏洞修复：禁止开拓者连续空指令（敌方同场无此问题）
-            if role.unit_id not in commands and not execute_cmd:
+            # executeCmd 期间也要有角色指令，否则开拓者会从任务点消失
+            if role.unit_id not in commands:
                 _hold_near_task(turn, role, claimed, commands)
             if role.unit_id in commands or prompt or execute_cmd:
                 return prompt, execute_cmd
@@ -452,7 +452,7 @@ def _accept_or_approach(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """有就绪任务就接；否则贴着任务点刷 accept（冷却无效也刷）。"""
+    """有就绪任务才接；冷却中走近任务点等待，不空刷 accept。"""
     task = pick_task(turn, role)
     if task is not None:
         if distance(role.pos, task.pos) <= 1:
@@ -470,12 +470,7 @@ def _accept_or_approach(
         return False
     nearest = min(points, key=lambda pos: distance(role.pos, pos))
     if distance(role.pos, nearest) <= 1:
-        commands[role.unit_id] = accept_task_command()
-        for item in turn.tasks:
-            if item.pos == nearest:
-                remember_task_accept(item, turn.round_no)
-                break
-        return True
+        return False
     step = _step_toward(turn, role, nearest, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
@@ -673,7 +668,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
             if pioneer.unit_id not in commands:
                 _stay_on_task(turn, pioneer, claimed, commands)
-            if pioneer.unit_id not in commands and not execute_cmd:
+            if pioneer.unit_id not in commands:
                 _hold_near_task(turn, pioneer, claimed, commands)
             if pioneer.unit_id in commands or prompt or execute_cmd:
                 used_controllers.add(pioneer.unit_id)

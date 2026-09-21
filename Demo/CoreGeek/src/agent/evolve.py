@@ -7,8 +7,6 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
-
 from .intel import (
     MEM,
     force_submit_now,
@@ -51,6 +49,10 @@ _TOKEN_HINT = re.compile(
     re.I,
 )
 _HEX12 = re.compile(r"\b([a-fA-F0-9]{12})\b")
+_PLACEHOLDER_TOKEN = re.compile(
+    r"^(xxx+|yyy+|zzz+|foo+|bar+|baz+|token|placeholder|example|sample|todo|null|none)$",
+    re.I,
+)
 _READ_TASK = re.compile(r"(?:请阅读|阅读|see|read)\s+(\S+\.md)", re.I)
 _TASK_MD = re.compile(r"(task[_-]\d+[_-][A-Za-z0-9_-]+\.md)", re.I)
 _SKIP_DIRS = (
@@ -222,7 +224,7 @@ def should_prioritize(turn: Turn) -> bool:
     if turn.available_tasks():
         return True
     if turn.round_no < MEM.skip_task_until:
-        return bool(turn.our_task_points() or turn.tasks)
+        return False
     return bool(turn.our_task_points() or turn.tasks)
 
 
@@ -269,13 +271,14 @@ def solve(
         concrete = _answer_from_sandbox(raw_result, task)
         if concrete and not is_junk_answer(concrete):
             payload = patch_task_answer(concrete, turn)
-            if _STATE.last_cmd and not _is_explore_cmd(_STATE.last_cmd):
-                if _STATE.last_cmd not in skill.good_cmds:
-                    skill.good_cmds.append(_STATE.last_cmd)
-            _commit_answer(role, commands, payload, skill)
-            _learn_from_answer(payload)
-            _learn_sop(skill)
-            return "", ""
+            if not is_junk_answer(payload):
+                if _STATE.last_cmd and not _is_explore_cmd(_STATE.last_cmd):
+                    if _STATE.last_cmd not in skill.good_cmds:
+                        skill.good_cmds.append(_STATE.last_cmd)
+                _commit_answer(role, commands, payload, skill)
+                _learn_from_answer(payload)
+                _learn_sop(skill)
+                return "", ""
 
     # 2) 消化 LLM：只接受 ANSWER / CMD，绝不把元描述当答案
     resp = turn.llm_resp.strip()
@@ -283,9 +286,10 @@ def solve(
         answer = _extract_tag(resp, "ANSWER")
         if answer and not is_junk_answer(answer):
             payload = patch_task_answer(answer, turn)
-            _commit_answer(role, commands, payload, skill)
-            _learn_from_answer(payload)
-            return "", ""
+            if not is_junk_answer(payload):
+                _commit_answer(role, commands, payload, skill)
+                _learn_from_answer(payload)
+                return "", ""
         cmd = _extract_tag(resp, "CMD")
         if cmd and "workspace_edit" not in cmd:
             MEM.awaiting_task = False
@@ -360,7 +364,6 @@ def next_probe_cmd(task: str, skill: Skill) -> str | None:
         return _bootstrap_cmd(task)
 
     if kind == "unknown-api" and not _STATE.http_done:
-        _STATE.http_done = True
         city = _STATE.city or _detect_city(_STATE.bundle or task) or "北京"
         return _http_probe_cmd(city)
 
@@ -401,14 +404,13 @@ def try_preset_answer(task: str, skill: Skill) -> str:
                 data = json.loads(blob)
             except json.JSONDecodeError:
                 continue
-            if isinstance(data, dict) and data and (
-                "token" in data or "total_count" in data or len(data) >= 2
-            ):
-                return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            if isinstance(data, dict) and data and not _is_placeholder_payload(data):
+                if "token" in data or "total_count" in data or len(data) >= 2:
+                    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     if _is_token_context(task):
         token = _extract_token(task)
-        if token:
+        if _valid_token(token):
             return json.dumps(
                 {"token": token}, ensure_ascii=False, separators=(",", ":"),
             )
@@ -478,28 +480,44 @@ def _task_filename(task: str) -> str:
     return files[0] if files else ""
 
 
+def _valid_token(text: str) -> bool:
+    token = (text or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{12,32}", token):
+        return False
+    return not _PLACEHOLDER_TOKEN.fullmatch(token)
+
+
+def _is_placeholder_payload(data: dict[str, Any]) -> bool:
+    token = str(data.get("token") or "")
+    if token and not _valid_token(token):
+        return True
+    if str(data.get("city") or "") in {"city", "城市", "example"}:
+        return True
+    return False
+
+
 def _extract_token(text: str) -> str:
     if not text:
         return ""
-    match = re.search(r"TOKEN\s*[:：]\s*([a-fA-F0-9]{8,32})", text, re.I)
-    if match:
+    # 工程题真值只在 check 的 TOKEN: 行；不要从 md 示例 / FWBUNDLE 里抽
+    match = re.search(r"TOKEN\s*[:：]\s*([a-fA-F0-9]{12,32})", text, re.I)
+    if match and _valid_token(match.group(1)):
         return match.group(1).lower()
+    stripped = re.sub(r"FWBUNDLE1\s*\{.*", "", text, flags=re.S)
     patterns = (
         r'["\']?(?:token|auth|secret|key|令牌|口令|认证码?|密钥|验证码)'
-        r'["\']?\s*[:=：]\s*["\']([a-fA-F0-9]{8,32})["\']',
+        r'["\']?\s*[:=：]\s*["\']([a-fA-F0-9]{12,32})["\']',
         r"(?:token|auth|secret|令牌|口令|认证码?|密钥|验证码)"
-        r"\s*[:=：]\s*([a-fA-F0-9]{8,32})",
-        r"ANSWER\s*:\s*([a-fA-F0-9]{8,32})",
+        r"\s*[:=：]\s*([a-fA-F0-9]{12,32})",
+        r"ANSWER\s*:\s*([a-fA-F0-9]{12,32})",
         r"\b([a-fA-F0-9]{12})\b",
         r"\b([a-fA-F0-9]{16})\b",
-        r"\b([a-fA-F0-9]{8})\b",
     )
     for pat in patterns:
-        found = re.search(pat, text, re.I)
-        if found:
+        found = re.search(pat, stripped, re.I)
+        if found and _valid_token(found.group(1)):
             return found.group(1).lower()
-    found = _HEX12.search(text)
-    return found.group(1).lower() if found else ""
+    return ""
 
 
 def _ingest_sandbox(raw: str, task: str, skill: Skill) -> None:
@@ -520,58 +538,107 @@ def _ingest_sandbox(raw: str, task: str, skill: Skill) -> None:
             base = url.group(0).split("?")[0]
             if "heritage" in base or "api" in base:
                 _HTTP_SOP.url = base.rstrip("/")
-        key = re.search(r"(heritage-api-key-\d+|[A-Za-z0-9_-]{12,40})", blob)
-        if key and "api-key" in key.group(1).lower():
+        key = re.search(r"(heritage-api-key-\d+)", blob)
+        if key:
             _HTTP_SOP.api_key = key.group(1)
 
-    http = _extract_tagged_json(raw, "FWHTTP1")
-    if http:
-        _STATE.http_done = True
+    https = _extract_tagged_jsons(raw, "FWHTTP1")
+    ok_http = [item for item in https if item.get("ok") or int(item.get("status") or 0) == 200]
+    for http in https:
         status = int(http.get("status") or 0)
         body = str(http.get("body") or "")
         if status == 401 and "Bearer" in body:
             _HTTP_SOP.auth = "bearer"
         if status == 400 and "location" in body.lower():
             _HTTP_SOP.param = "location"
-        if http.get("ok") and status in {0, 200}:
-            _HTTP_SOP.auth = _HTTP_SOP.auth or "bearer"
-            _HTTP_SOP.param = _HTTP_SOP.param or "location"
+    if ok_http:
+        _HTTP_SOP.auth = _HTTP_SOP.auth or "bearer"
+        _HTTP_SOP.param = _HTTP_SOP.param or "location"
+        page_sizes: list[int] = []
+        for item in ok_http:
+            try:
+                page_sizes.append(
+                    len(_records_of(json.loads(str(item.get("body") or ""))))
+                )
+            except json.JSONDecodeError:
+                page_sizes.append(0)
+        # 单页满 10 条且没有 ANSWER：输出可能被截断，下回合再拉
+        complete = bool(re.search(r"ANSWER\s*:", raw, re.I)) or (
+            bool(page_sizes) and page_sizes[-1] < 10
+        )
+        if complete:
+            _STATE.http_done = True
             skill.steps = "LOCAL_HTTP"
+        else:
+            _STATE.http_done = False
+    elif https:
+        # 只有 401/400：记下 SOP，下回合带着纠正后的头再打
+        _STATE.http_done = False
 
-    if re.search(r"\[\s*OK\s*\]|全部通过|TOKEN\s*:", raw, re.I):
+    if re.search(r"\[\s*OK\s*\]|全部通过", raw, re.I) and _extract_token(raw):
         skill.steps = "WORKSPACE_EDIT>VERIFY"
 
 
 def _answer_from_sandbox(raw: str, task: str) -> str:
-    token = _extract_token(raw)
-    if token and (
-        re.search(r"\[\s*OK\s*\]|全部通过|TOKEN\s*:", raw, re.I)
-        or _STATE.kind == "engineering-fix"
-        or _is_token_context(task)
-    ):
-        return json.dumps({"token": token}, ensure_ascii=False, separators=(",", ":"))
+    # 1) 工程题：必须 check 通过且 TOKEN 是 12+ 位 hex，拒绝 xxx
+    if re.search(r"\[\s*OK\s*\]|全部通过", raw, re.I):
+        token = _extract_token(raw)
+        if _valid_token(token):
+            return json.dumps(
+                {"token": token}, ensure_ascii=False, separators=(",", ":"),
+            )
 
-    tagged = _extract_tagged_json(raw, "FWHTTP1")
-    if tagged and (tagged.get("ok") or int(tagged.get("status") or 0) == 200):
-        city = _STATE.city or _detect_city(task) or ""
-        stats = _heritage_stats(str(tagged.get("body") or ""), city)
-        if stats:
-            return stats
-
+    # 2) 显式 ANSWER:（脚本分页统计后的完整 JSON）
     concrete = concrete_sandbox_answer(raw)
-    if concrete:
+    if concrete and not is_junk_answer(concrete):
         return concrete
+
+    # 3) 取最后一次成功的 HTTP 体做统计（不要用第一页 401/10 条）
+    ok_http = [
+        item for item in _extract_tagged_jsons(raw, "FWHTTP1")
+        if item.get("ok") or int(item.get("status") or 0) == 200
+    ]
+    if ok_http:
+        city = _STATE.city or _detect_city(task) or ""
+        merged: list[Any] = []
+        seen: set[str] = set()
+        last_body = ""
+        for item in ok_http:
+            last_body = str(item.get("body") or "")
+            try:
+                data = json.loads(last_body)
+            except json.JSONDecodeError:
+                continue
+            for rec in _records_of(data):
+                if not isinstance(rec, dict):
+                    continue
+                key = str(rec.get("id") or rec.get("name") or json.dumps(rec, ensure_ascii=False))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(rec)
+        if merged:
+            last_n = 0
+            try:
+                last_n = len(_records_of(json.loads(last_body))) if last_body else 0
+            except json.JSONDecodeError:
+                last_n = len(merged)
+            # 只有一页且刚好 10 条：多半还有下一页，等分页 ANSWER
+            if last_n < 10 or (len(ok_http) >= 2 and last_n <= 10):
+                stats = _heritage_stats_from_records(merged, city)
+                if stats:
+                    return stats
+        stats = _heritage_stats(last_body, city)
+        if stats and last_body:
+            try:
+                if len(_records_of(json.loads(last_body))) < 10:
+                    return stats
+            except json.JSONDecodeError:
+                pass
     return ""
 
 
-def _heritage_stats(body: str, city: str) -> str:
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return ""
-    records = _records_of(data)
-    if not records:
-        return ""
+def _heritage_stats_from_records(records: list[Any], city: str) -> str:
     types: list[str] = []
     world = 0
     oldest_name = ""
@@ -591,14 +658,27 @@ def _heritage_stats(body: str, city: str) -> str:
         if name and rank < oldest_rank:
             oldest_rank = rank
             oldest_name = name
+    if not records:
+        return ""
     payload = {
-        "city": city or str(data.get("city") or ""),
+        "city": city,
         "total_count": len(records),
         "world_heritage_count": world,
         "types": types,
         "oldest_era": oldest_name,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _heritage_stats(body: str, city: str) -> str:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return ""
+    records = _records_of(data)
+    if not records:
+        return ""
+    return _heritage_stats_from_records(records, city or str(data.get("city") or ""))
 
 
 def _records_of(data: Any) -> list[Any]:
@@ -623,18 +703,22 @@ def _era_rank(era: str) -> int:
 
 
 def _extract_tagged_json(raw: str, tag: str) -> dict[str, Any] | None:
-    match = re.search(rf"{tag}\s+(\{{.*)", raw, re.S)
-    if not match:
-        return None
-    blob = match.group(1).strip()
-    for end in range(len(blob), 1, -1):
+    items = _extract_tagged_jsons(raw, tag)
+    return items[-1] if items else None
+
+
+def _extract_tagged_jsons(raw: str, tag: str) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    for match in re.finditer(rf"{tag}\s+", raw):
+        blob = raw[match.end():].lstrip()
         try:
-            data = json.loads(blob[:end])
+            data, _ = decoder.raw_decode(blob)
         except json.JSONDecodeError:
             continue
         if isinstance(data, dict):
-            return data
-    return None
+            found.append(data)
+    return found
 
 
 def _learn_from_answer(payload: str) -> None:
@@ -689,7 +773,6 @@ def _bootstrap_cmd(task: str) -> str:
 def _http_probe_cmd(city: str) -> str:
     url = _HTTP_SOP.url
     key = _HTTP_SOP.api_key
-    city_q = quote(city)
     prefer_auth = _HTTP_SOP.auth or ""
     prefer_param = _HTTP_SOP.param or ""
     return (
@@ -704,58 +787,65 @@ def _http_probe_cmd(city: str) -> str:
         "auths = []\n"
         "if PREFER_AUTH == 'bearer':\n"
         "    auths.append({'Authorization': 'Bearer ' + KEY})\n"
-        "auths += [{'X-API-Key': KEY}, {'Authorization': 'Bearer ' + KEY}, {}]\n"
+        "auths += [{'Authorization': 'Bearer ' + KEY}, {'X-API-Key': KEY}]\n"
         "params = []\n"
-        "if PREFER_PARAM:\n"
-        "    params.append(PREFER_PARAM)\n"
-        "params += ['location', 'city', 'q']\n"
+        "if PREFER_PARAM: params.append(PREFER_PARAM)\n"
+        "params += ['location', 'city']\n"
         "seen=set(); auths=[a for a in auths if tuple(a.items()) not in seen and not seen.add(tuple(a.items()))]\n"
         "seen=set(); params=[p for p in params if p not in seen and not seen.add(p)]\n"
-        "last = {'ok': False, 'status': 0, 'body': '', 'error': ''}\n"
-        "ok_body = ''\n"
         "def fetch(headers, query):\n"
         "    req = urllib.request.Request(URL + '?' + query, headers=headers)\n"
         "    try:\n"
-        "        with urllib.request.urlopen(req, timeout=10) as resp:\n"
-        "            return resp.status, resp.read(80000).decode('utf-8', 'ignore'), ''\n"
+        "        with urllib.request.urlopen(req, timeout=6) as resp:\n"
+        "            return resp.status, resp.read(80000).decode('utf-8', 'ignore')\n"
         "    except urllib.error.HTTPError as exc:\n"
-        "        return exc.code, exc.read(8000).decode('utf-8', 'ignore'), 'HTTPError'\n"
+        "        return exc.code, exc.read(4000).decode('utf-8', 'ignore')\n"
         "    except Exception as exc:\n"
-        "        return 0, str(exc), type(exc).__name__\n"
+        "        return 0, str(exc)\n"
+        "def recs(body):\n"
+        "    try: data=json.loads(body)\n"
+        "    except Exception: return []\n"
+        "    inner=data.get('data') if isinstance(data, dict) and isinstance(data.get('data'), dict) else data\n"
+        "    if not isinstance(inner, dict): return []\n"
+        "    val=inner.get('records') or inner.get('items') or inner.get('list') or []\n"
+        "    return val if isinstance(val, list) else []\n"
+        "logs=[]; pair=None\n"
         "for headers in auths:\n"
         "    for param in params:\n"
-        "        for extra in ('', '&page=1', '&offset=0&limit=100&page=1'):\n"
-        "            q = param + '=' + enc + extra\n"
-        "            status, body, err = fetch(headers, q)\n"
-        "            last = {'ok': 200 <= status < 300, 'status': status, 'body': body, 'error': err}\n"
-        "            print('FWHTTP1 ' + json.dumps(last, ensure_ascii=False)[:4000])\n"
-        "            if last['ok']:\n"
-        "                ok_body = body\n"
-        "                break\n"
-        "        if ok_body:\n"
-        "            break\n"
-        "    if ok_body:\n"
-        "        break\n"
-        "if ok_body:\n"
-        "    try: data = json.loads(ok_body)\n"
-        "    except Exception: data = {}\n"
-        "    rec = []\n"
-        "    if isinstance(data, dict):\n"
-        "        inner = data.get('data') if isinstance(data.get('data'), dict) else data\n"
-        "        rec = inner.get('records') or inner.get('items') or inner.get('list') or []\n"
-        "    if isinstance(rec, list) and rec:\n"
-        "        types=[]; world=0; oldest=''; rank=10**6\n"
-        "        eras=['旧石器','新石器','史前','商周','商','周','春秋','战国','秦','汉','三国','晋','南北朝','隋','唐','五代','宋','元','明','清','民国']\n"
-        "        for item in rec:\n"
+        "        status, body = fetch(headers, param+'='+enc+'&offset=0&limit=10')\n"
+        "        logs.append({'ok':200<=status<300,'status':status,'n':len(recs(body)),'body':body[:400]})\n"
+        "        if 200<=status<300:\n"
+        "            pair=(headers,param); break\n"
+        "    if pair: break\n"
+        "ans=None\n"
+        "if pair:\n"
+        "    headers, param = pair\n"
+        "    all_rec=[]; seen=set(); offset=0\n"
+        "    while offset<=80:\n"
+        "        status, body = fetch(headers, param+'='+enc+'&offset=%d&limit=10'%offset)\n"
+        "        chunk=recs(body)\n"
+        "        logs.append({'ok':200<=status<300,'status':status,'n':len(chunk),'offset':offset})\n"
+        "        for item in chunk:\n"
         "            if not isinstance(item, dict): continue\n"
-        "            k=str(item.get('type') or '')\n"
-        "            if k and k not in types: types.append(k)\n"
-        "            if '世界遗产' in str(item.get('protected_level') or ''): world += 1\n"
-        "            era=str(item.get('era') or ''); r=next((i for i,n in enumerate(eras) if n in era), 10**6)\n"
-        "            name=str(item.get('name') or '')\n"
-        "            if name and r < rank: rank=r; oldest=name\n"
-        "        ans={'city':CITY,'total_count':len(rec),'world_heritage_count':world,'types':types,'oldest_era':oldest}\n"
-        "        print('ANSWER:' + json.dumps(ans, ensure_ascii=False, separators=(',', ':')))\n"
+        "            k=str(item.get('id') or item.get('name') or json.dumps(item,ensure_ascii=False))\n"
+        "            if k in seen: continue\n"
+        "            seen.add(k); all_rec.append(item)\n"
+        "        if len(chunk)<10: break\n"
+        "        offset += 10\n"
+        "    types=[]; world=0; oldest=''; rank=10**6\n"
+        "    eras=['旧石器','新石器','史前','商周','商','周','春秋','战国','秦','汉','三国','晋','南北朝','隋','唐','五代','宋','元','明','清','民国']\n"
+        "    for item in all_rec:\n"
+        "        k=str(item.get('type') or '')\n"
+        "        if k and k not in types: types.append(k)\n"
+        "        if '世界遗产' in str(item.get('protected_level') or ''): world += 1\n"
+        "        era=str(item.get('era') or ''); r=next((i for i,n in enumerate(eras) if n in era), 10**6)\n"
+        "        name=str(item.get('name') or '')\n"
+        "        if name and r<rank: rank=r; oldest=name\n"
+        "    ans={'city':CITY,'total_count':len(all_rec),'world_heritage_count':world,'types':types,'oldest_era':oldest}\n"
+        "if ans is not None:\n"
+        "    print('ANSWER:'+json.dumps(ans, ensure_ascii=False, separators=(',', ':')))\n"
+        "for item in logs:\n"
+        "    print('FWHTTP1 '+json.dumps(item, ensure_ascii=False)[:800])\n"
         "PY"
     )
 
@@ -800,7 +890,7 @@ def _workspace_fix_cmd(task: str) -> str:
         "                ws=p; break\n"
         "print('ws', ws, 'app', app)\n"
         "if ws is None:\n"
-        "    print('ANSWER:')\n"
+        "    print('NEED_WORKSPACE')\n"
         "    raise SystemExit\n"
         "logs=ws/'logs'/app\n"
         "logs.mkdir(mode=0o755, parents=True, exist_ok=True)\n"
@@ -845,11 +935,15 @@ def _workspace_fix_cmd(task: str) -> str:
         "        proc=subprocess.run(cmd, cwd=str(ws), capture_output=True, text=True, timeout=20)\n"
         "        out=(proc.stdout or '')+'\\n'+(proc.stderr or '')\n"
         "        print(out)\n"
-        "        m=re.search(r'TOKEN\\s*[:：]\\s*([a-fA-F0-9]{8,32})', out, re.I)\n"
+        "        m=re.search(r'TOKEN\\s*[:：]\\s*([a-fA-F0-9]{12,32})', out, re.I)\n"
         "        if m: token=m.group(1).lower()\n"
+        "        if '[ OK ]' in out or '全部通过' in out:\n"
+        "            print(out)\n"
+        "        else:\n"
+        "            print(out[:1500])\n"
         "    except Exception as exc:\n"
         "        print(exc)\n"
-        "if token:\n"
+        "if token and len(token)>=12 and token not in {'xxx','yyy','zzz'}:\n"
         "    print('ANSWER:' + json.dumps({'token': token}, separators=(',', ':')))\n"
         "PY"
     )
@@ -883,15 +977,23 @@ def concrete_sandbox_answer(raw: str) -> str:
             if text.startswith("{") and text.endswith("}"):
                 try:
                     data = json.loads(text)
-                    if isinstance(data, dict) and data:
+                    if isinstance(data, dict) and data and not _is_placeholder_payload(data):
                         return json.dumps(
                             data, ensure_ascii=False, separators=(",", ":"),
                         )
                 except json.JSONDecodeError:
                     pass
-            if not _PATH_LIKE.search(text) and "/" not in text and not text.startswith("."):
+            if (
+                not _PATH_LIKE.search(text)
+                and "/" not in text
+                and not text.startswith(".")
+                and _valid_token(text)
+            ):
                 return text
 
+    # 不要把 md 示例 JSON 行当答案（FWBUNDLE 全文里常有 {"token":"xxx"}）
+    if "FWBUNDLE1" in raw and "ANSWER:" not in raw.upper():
+        return ""
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     for line in reversed(lines):
         if line.startswith("[exitCode:") or line == "[TRUNCATED]":
@@ -904,7 +1006,7 @@ def concrete_sandbox_answer(raw: str) -> str:
             data = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and data and (
+        if isinstance(data, dict) and data and not _is_placeholder_payload(data) and (
             "token" in data or "total_count" in data or "city" in data
         ):
             return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -924,6 +1026,17 @@ def is_junk_answer(text: str) -> bool:
     if re.search(r"(^|\s)(proc|sys|dev)/", blob):
         return True
     if re.fullmatch(r"[\w./\\-]+", blob) and ("/" in blob or "\\" in blob):
+        return True
+    if blob.startswith("{"):
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and _is_placeholder_payload(data):
+            return True
+        if isinstance(data, dict) and "token" in data and not _valid_token(str(data.get("token") or "")):
+            return True
+    elif _PLACEHOLDER_TOKEN.fullmatch(blob) or not _valid_token(blob) and blob.lower() in {"xxx", "yyy"}:
         return True
     return False
 
@@ -948,6 +1061,8 @@ def build_prompt(turn: Turn, skill: Skill) -> str:
         "工程修复题：改 workspace（mkdir logs、改 conf、chmod start.sh），再跑 ./check，从 TOKEN: 交卷。",
         "API 题：用 HTTP 拉全量记录再统计；401 改 Bearer，缺参就按报错改参数名。",
         "禁止输出 workspace_edit；禁止写 SOP 说明；禁止把路径当答案。",
+        "禁止提交 {\"token\":\"xxx\"} 或 md 里的示例 JSON；工程题必须 check 输出 [ OK ] 和 TOKEN: 后才交。",
+        "API 题必须分页拉全量（offset+=10 直到本页不足 10 条），禁止只交第一页。",
         "若已得到最终答案，只输出一行：ANSWER:<最终答案，优先合法 JSON>",
         "若还需执行命令，只输出一行：CMD:<单条命令>",
         "",

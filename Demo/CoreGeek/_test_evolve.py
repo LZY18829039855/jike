@@ -40,6 +40,14 @@ bare_ans = try_preset_answer("提交以下字符串完成校验：c8be2288b213",
 assert "c8be2288b213" in bare_ans
 assert try_preset_answer("请阅读task_1_beijing.md，获取任务信息", skill) == ""
 assert try_preset_answer("查询北京世界遗产与文物统计", skill) == ""
+assert try_preset_answer('请提交 {"token":"xxx"}', skill) == ""
+assert is_junk_answer('{"token":"xxx"}')
+assert _answer_from_sandbox(
+    '[exitCode:0]\nFWBUNDLE1 {"ok":true,"task_path":"./task_1_alpha.md",'
+    '"task":"submit {\\"token\\":\\"xxx\\"}"}',
+    "请阅读task_1_alpha.md，获取任务信息",
+) == ""
+assert "offset" in __import__("agent.evolve", fromlist=["_http_probe_cmd"])._http_probe_cmd("北京")
 
 # check TOKEN → 交卷
 check_out = "[exitCode:0]\n[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a |"
@@ -102,6 +110,27 @@ assert cmd.get("action") == "submitAnswer", out
 answer = cmd.get("taskAnswer", "")
 assert "南京" in answer or "total_count" in answer, cmd
 
+# 单页满 10 条且无 ANSWER：不得当全量交卷
+reset_memory()
+reset()
+payload["phaseTask"] = "请阅读task_1_beijing.md，获取任务信息"
+ten = ",".join(
+    [
+        f'{{\\"id\\": \\"BJ{i:03d}\\", \\"name\\": \\"遗址{i}\\", '
+        f'\\"type\\": \\"遗址\\", \\"era\\": \\"明\\", \\"protected_level\\": \\"全国重点\\"}}'
+        for i in range(10)
+    ]
+)
+payload["lastCmdResult"] = (
+    '[exitCode:0] | FWHTTP1 {"ok": true, "status": 200, '
+    f'"body": "{{\\"code\\": 200, \\"data\\": {{\\"records\\": [{ten}]}}}}"'
+    " } |"
+)
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert cmd.get("action") != "submitAnswer", out
+assert "python3" in (out.get("executeCmd") or "") or out.get("prompt"), out
+
 # 垃圾 LLM 答案不得直接提交
 reset_memory()
 reset()
@@ -118,6 +147,16 @@ assert (
     or out["executeCmd"]
     or out["prompt"]
 ), out
+
+# 占位 token 不得交卷
+reset_memory()
+reset()
+payload["phaseTask"] = "请阅读task_1_alpha.md，获取任务信息"
+payload["llmResp"] = 'ANSWER:{"token":"xxx"}'
+payload["lastCmdResult"] = ""
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert cmd.get("taskAnswer") != '{"token":"xxx"}', out
 
 # 开局工人应优先去建火箭炮（金币足够时）
 reset_memory()
