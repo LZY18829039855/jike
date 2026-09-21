@@ -114,6 +114,8 @@ class EvolveState:
     http_done: bool = False
     ws_done: bool = False
     boot_done: bool = False
+    fingerprint: str = ""
+    drop_sandbox: bool = False
 
 
 _SKILLS: dict[str, Skill] = {}
@@ -145,29 +147,45 @@ def reset() -> None:
     _STATE.http_done = False
     _STATE.ws_done = False
     _STATE.boot_done = False
+    _STATE.fingerprint = ""
+    _STATE.drop_sandbox = False
+
+
+def _task_fingerprint(task: str) -> str:
+    return "|".join((
+        _task_filename(task) or "",
+        _detect_city(task) or "",
+        _detect_app(task) or "",
+        _classify(task) or "",
+    ))
 
 
 def on_task_text(task: str) -> None:
-    """phaseTask 文本变化时切换子题，保留超时计时，重置求解态。"""
+    """题目文件/城市/应用一变就重置求解态，避免把上一题沙盒结果交到新题。"""
     family = task_family(task)
-    if family != _STATE.family:
-        _STATE.family = family
-        _STATE.kind = _classify(task)
-        _STATE.explore_i = 0
-        _STATE.last_cmd = ""
-        _STATE.last_sandbox = ""
-        _STATE.asked_llm = False
-        _STATE.reused_skill = False
-        _STATE.task_file = _task_filename(task)
-        _STATE.task_path = ""
-        _STATE.bundle = ""
-        _STATE.city = _detect_city(task) or ""
-        _STATE.app_name = _detect_app(task)
-        _STATE.ws_dir = ""
-        _STATE.http_done = False
-        _STATE.ws_done = False
-        _STATE.boot_done = False
-        MEM.awaiting_task = False
+    fingerprint = _task_fingerprint(task)
+    if fingerprint == _STATE.fingerprint and family == _STATE.family:
+        return
+    prev = _STATE.fingerprint
+    _STATE.family = family
+    _STATE.kind = _classify(task)
+    _STATE.explore_i = 0
+    _STATE.last_cmd = ""
+    _STATE.last_sandbox = ""
+    _STATE.asked_llm = False
+    _STATE.reused_skill = False
+    _STATE.task_file = _task_filename(task)
+    _STATE.task_path = ""
+    _STATE.bundle = ""
+    _STATE.city = _detect_city(task) or ""
+    _STATE.app_name = _detect_app(task)
+    _STATE.ws_dir = ""
+    _STATE.http_done = False
+    _STATE.ws_done = False
+    _STATE.boot_done = False
+    _STATE.fingerprint = fingerprint
+    _STATE.drop_sandbox = bool(prev)
+    MEM.awaiting_task = False
 
 
 def task_family(text: str) -> str:
@@ -261,17 +279,19 @@ def solve(
     on_task_text(task)
     family = _STATE.family or task_family(task)
     skill = _SKILLS.setdefault(family, Skill(family=family))
+    drop_stale = _STATE.drop_sandbox
+    _STATE.drop_sandbox = False
 
     # 1) 消化沙盒：bundle / HTTP / check TOKEN / 显式 ANSWER
     raw_result = turn.last_cmd_result.strip()
-    if raw_result:
+    if raw_result and not drop_stale:
         _STATE.last_sandbox = _clip(raw_result, 3500)
         skill.sandbox_notes = _STATE.last_sandbox[-1500:]
         _ingest_sandbox(raw_result, task, skill)
         concrete = _answer_from_sandbox(raw_result, task)
-        if concrete and not is_junk_answer(concrete):
+        if concrete and not is_junk_answer(concrete) and _answer_fits_task(concrete, task):
             payload = patch_task_answer(concrete, turn)
-            if not is_junk_answer(payload):
+            if not is_junk_answer(payload) and _answer_fits_task(payload, task):
                 if _STATE.last_cmd and not _is_explore_cmd(_STATE.last_cmd):
                     if _STATE.last_cmd not in skill.good_cmds:
                         skill.good_cmds.append(_STATE.last_cmd)
@@ -284,9 +304,9 @@ def solve(
     resp = turn.llm_resp.strip()
     if resp and MEM.awaiting_task:
         answer = _extract_tag(resp, "ANSWER")
-        if answer and not is_junk_answer(answer):
+        if answer and not is_junk_answer(answer) and _answer_fits_task(answer, task):
             payload = patch_task_answer(answer, turn)
-            if not is_junk_answer(payload):
+            if not is_junk_answer(payload) and _answer_fits_task(payload, task):
                 _commit_answer(role, commands, payload, skill)
                 _learn_from_answer(payload)
                 return "", ""
@@ -303,7 +323,7 @@ def solve(
     # 3) 题干里直接嵌了完整答案（短任务，非「请阅读 md」）才秒交
     if not _is_read_file_task(task):
         preset = try_preset_answer(task, skill)
-        if preset and not is_junk_answer(preset):
+        if preset and not is_junk_answer(preset) and _answer_fits_task(preset, task):
             payload = patch_task_answer(preset, turn)
             _commit_answer(role, commands, payload, skill)
             _learn_from_answer(payload)
@@ -329,7 +349,7 @@ def solve(
     # 6) 快超时保底：只用沙盒证据，不用写死城市库
     if force_submit_now(turn):
         payload = patch_task_answer(_fallback_answer(turn), turn)
-        if payload and not is_junk_answer(payload):
+        if payload and not is_junk_answer(payload) and _answer_fits_task(payload, task):
             _commit_answer(role, commands, payload, skill)
             return "", ""
         if MEM.task_required:
@@ -415,6 +435,38 @@ def try_preset_answer(task: str, skill: Skill) -> str:
                 {"token": token}, ensure_ascii=False, separators=(",", ":"),
             )
     return ""
+
+
+def _answer_fits_task(payload: str, task: str) -> bool:
+    """工程题只交 TOKEN，API 题只交当前城市统计，禁止串题。"""
+    blob = (payload or "").strip()
+    if not blob:
+        return False
+    kind = _STATE.kind or _classify(task) or _classify(_STATE.bundle)
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        data = None
+    if kind == "engineering-fix":
+        token = ""
+        if isinstance(data, dict):
+            token = str(data.get("token") or "")
+        elif _valid_token(blob):
+            token = blob
+        return _valid_token(token)
+    if kind == "unknown-api":
+        if not isinstance(data, dict):
+            return False
+        if "total_count" not in data and "city" not in data:
+            return False
+        city = _STATE.city or _detect_city(task) or _detect_city(_STATE.bundle) or ""
+        got = str(data.get("city") or "")
+        if city and got and got != city:
+            return False
+        if "token" in data and not _valid_token(str(data.get("token") or "")):
+            return False
+        return True
+    return not is_junk_answer(blob)
 
 
 def _is_read_file_task(task: str) -> bool:
@@ -1103,7 +1155,7 @@ def _commit_answer(
     payload: str,
     skill: Skill,
 ) -> None:
-    if is_junk_answer(payload):
+    if is_junk_answer(payload) or not _answer_fits_task(payload, _STATE.task_file or ""):
         MEM.awaiting_task = False
         return
     remember_answer(payload)
@@ -1113,16 +1165,17 @@ def _commit_answer(
 
 
 def _fallback_answer(turn: Turn) -> str:
+    task = turn.phase_task
     for source in (
         MEM.task_answer,
         _extract_tag(turn.llm_resp, "ANSWER"),
-        _answer_from_sandbox(turn.last_cmd_result, turn.phase_task),
+        _answer_from_sandbox(turn.last_cmd_result, task),
         concrete_sandbox_answer(turn.last_cmd_result),
     ):
-        if source and source.strip() and not is_junk_answer(source):
+        if source and source.strip() and not is_junk_answer(source) and _answer_fits_task(source, task):
             return source.strip()
     skill = _SKILLS.get(_STATE.family)
-    if skill and skill.last_answer and not is_junk_answer(skill.last_answer):
+    if skill and skill.last_answer and not is_junk_answer(skill.last_answer) and _answer_fits_task(skill.last_answer, task):
         return skill.last_answer
     if MEM.task_required:
         return "{}"

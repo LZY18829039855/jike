@@ -399,8 +399,13 @@ def _observe_task(turn: Turn) -> None:
             MEM.task_started_round = turn.round_no
             pioneer = turn.pioneer()
             if pioneer is not None and turn.tasks:
+                standing = [
+                    item for item in turn.tasks
+                    if distance(pioneer.pos, item.pos) <= 1
+                ]
+                pool = standing or list(turn.tasks)
                 nearest = min(
-                    turn.tasks,
+                    pool,
                     key=lambda item: distance(pioneer.pos, item.pos),
                 )
                 MEM.task_timeout = nearest.timeout_rounds

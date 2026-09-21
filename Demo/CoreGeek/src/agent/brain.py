@@ -391,24 +391,19 @@ def _pioneer_day(
 
     # —— 开拓者金币主线：能开宝藏就开；否则刷任务点 ——
     if turn.phase_task.strip():
-        if should_abandon_task(turn) or treasure_may_interrupt(turn):
-            if treasure_may_interrupt(turn) and _hunt_treasure(
-                turn, role, claimed, commands,
-            ):
-                return "", ""
+        # 先求解/交卷，避免超时离点时把刚拿到的答案扔掉
+        prompt, execute_cmd = solve_evolve_task(turn, role, commands)
+        submitted = (commands.get(role.unit_id) or {}).get("action") == "submitAnswer"
+        if submitted:
+            return prompt, execute_cmd
+        if should_abandon_task(turn):
             if _leave_task(turn, role, claimed, commands):
                 return "", ""
-        else:
-            prompt, execute_cmd = solve_evolve_task(turn, role, commands)
-            # executeCmd 与角色指令独立；未交卷时务必停在任务点周围，否则任务会被强制结束
-            if role.unit_id not in commands:
-                _stay_on_task(turn, role, claimed, commands)
-            # executeCmd 期间也要有角色指令，否则开拓者会从任务点消失
-            if role.unit_id not in commands:
-                _hold_near_task(turn, role, claimed, commands)
-            if role.unit_id in commands or prompt or execute_cmd:
-                return prompt, execute_cmd
             return "", ""
+        _glue_to_task(turn, role, claimed, commands)
+        if role.unit_id in commands or prompt or execute_cmd:
+            return prompt, execute_cmd
+        return "", ""
 
     prompt = _maybe_treasure_prompt(turn)
 
@@ -522,17 +517,7 @@ def _stay_on_task(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    points = turn.our_task_points() or tuple(task.pos for task in turn.tasks)
-    if not points:
-        return False
-    nearest = min(points, key=lambda pos: distance(role.pos, pos))
-    if distance(role.pos, nearest) <= 1:
-        return False
-    step = _step_toward(turn, role, nearest, claimed)
-    if step is not None:
-        commands[role.unit_id] = move_command(step)
-        return True
-    return False
+    return _glue_to_task(turn, role, claimed, commands)
 
 
 def _hold_near_task(
@@ -541,22 +526,31 @@ def _hold_near_task(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """已在任务点旁但仍无指令时，绕点走动占位，避免 roleCommandMap 缺开拓者。"""
-    points = turn.our_task_points() or tuple(task.pos for task in turn.tasks)
-    if not points:
+    return _glue_to_task(turn, role, claimed, commands)
+
+
+def _glue_to_task(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """钉在当前接取任务点 1 格内；走出 1 格任务会被强制结束。"""
+    if role.unit_id in commands:
         return False
-    nearest = min(points, key=lambda pos: distance(role.pos, pos))
-    for dx, dy in _NEIGHBOUR_STEPS:
-        pos = Pos(nearest.x + dx, nearest.y + dy)
-        if pos == role.pos or pos in claimed:
-            continue
-        if not turn.land(pos):
-            continue
-        if distance(role.pos, pos) <= 1:
-            commands[role.unit_id] = move_command(pos)
-            claimed.add(pos)
+    anchor = MEM.task_pos or MEM.pending_task_pos
+    if anchor is None:
+        return False
+    dist = distance(role.pos, anchor)
+    if dist == 0:
+        return False
+    if dist == 1:
+        if turn.land(anchor) and anchor not in claimed:
+            commands[role.unit_id] = move_command(anchor)
+            claimed.add(anchor)
             return True
-    step = _step_toward(turn, role, nearest, claimed)
+        return False
+    step = _step_toward(turn, role, anchor, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
         return True
@@ -658,18 +652,15 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
 
     # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点；再否则当炮手
     if pioneer is not None and turn.phase_task.strip():
-        if should_abandon_task(turn):
+        prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
+        submitted = (commands.get(pioneer.unit_id) or {}).get("action") == "submitAnswer"
+        if submitted:
+            used_controllers.add(pioneer.unit_id)
+        elif should_abandon_task(turn):
             if _leave_task(turn, pioneer, claimed, commands):
                 used_controllers.add(pioneer.unit_id)
-        elif treasure_may_interrupt(turn) and MEM.treasure.phase == "night":
-            if _hunt_treasure(turn, pioneer, claimed, commands):
-                used_controllers.add(pioneer.unit_id)
         else:
-            prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
-            if pioneer.unit_id not in commands:
-                _stay_on_task(turn, pioneer, claimed, commands)
-            if pioneer.unit_id not in commands:
-                _hold_near_task(turn, pioneer, claimed, commands)
+            _glue_to_task(turn, pioneer, claimed, commands)
             if pioneer.unit_id in commands or prompt or execute_cmd:
                 used_controllers.add(pioneer.unit_id)
     elif pioneer is not None and treasure_ready(turn) and MEM.treasure.phase == "night":

@@ -158,6 +158,37 @@ out = decide(payload)
 cmd = out["roleCommandMap"].get("10011") or {}
 assert cmd.get("taskAnswer") != '{"token":"xxx"}', out
 
+# 工程题不得把上一题的文物 JSON 当答案
+reset_memory()
+reset()
+payload["phaseTask"] = "请阅读task_1_alpha.md，获取任务信息"
+payload["llmResp"] = ""
+payload["lastCmdResult"] = (
+    '[exitCode:0] ANSWER:{"city":"北京","total_count":15,'
+    '"world_heritage_count":6,"types":["建筑"],"oldest_era":"周口店遗址"}'
+)
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert cmd.get("action") != "submitAnswer", out
+assert "python3" in (out.get("executeCmd") or "") or out.get("prompt"), out
+
+# 在任务点上不得走向另一个任务点
+reset_memory()
+reset()
+payload["phaseTask"] = "请阅读task_2_nanjing.md，获取任务信息"
+payload["lastCmdResult"] = ""
+payload["llmResp"] = ""
+for role in payload["teamOur"]["roles"]:
+    if role.get("roleType") == "pioneer":
+        role["pos"] = {"x": 14, "y": 14}
+        break
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+if cmd.get("action") == "move":
+    dest = (cmd["targetPos"][0]["x"], cmd["targetPos"][0]["y"])
+    assert abs(dest[0] - 14) + abs(dest[1] - 14) <= 2, cmd
+    assert dest != (17, 17), cmd
+
 # 开局工人应优先去建火箭炮（金币足够时）
 reset_memory()
 reset()
