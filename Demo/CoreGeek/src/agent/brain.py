@@ -226,11 +226,17 @@ def _worker_day(
                     return budget - WEAPON_BUILD_COST
                 return budget
 
-    # 6) 白天砌墙：石头免费换血量
+    # 6) 先砌来敌面全长 + 上下各一半，再去做别的
     if walls_missing and _wall_work(
         turn, role, walls_missing, claimed, commands,
     ):
         return budget
+
+    # 6.5) 核心墙完成后，再升级武器
+    if _prefer_weapon_upgrade(turn, role, budget):
+        spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
+        if spent is not None:
+            return budget - spent
 
     # 7) 有铜/铁/涨价矿就尽快卖掉换成金币
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
@@ -245,6 +251,46 @@ def _worker_day(
     if _mine_economy(turn, role, claimed, commands, keep_stone=bool(walls_missing)):
         return budget
     return budget
+
+
+def _prefer_weapon_upgrade(turn: Turn, role: Unit, budget: int) -> bool:
+    """核心墙已齐、有塔且金币够时，去买武器升级券。"""
+    weapons = turn.weapons()
+    if not weapons:
+        return False
+    if role.find_item(WEAPON_UPGRADE_1) or role.find_item(WEAPON_UPGRADE_2):
+        return False
+    if any(tower.level == 1 for tower in weapons):
+        return budget >= turn.shop_price(WEAPON_UPGRADE_1)
+    if any(tower.level == 2 for tower in weapons):
+        return budget >= turn.shop_price(WEAPON_UPGRADE_2)
+    return False
+
+
+def _buy_weapon_upgrade(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    budget: int,
+) -> int | None:
+    weapons = turn.weapons()
+    name = None
+    if any(tower.level == 1 for tower in weapons):
+        name = WEAPON_UPGRADE_1
+    elif any(tower.level == 2 for tower in weapons):
+        name = WEAPON_UPGRADE_2
+    if name is None:
+        return None
+    price = turn.shop_price(name)
+    if budget < price:
+        return None
+    if _buy_named_or_walk(turn, role, name, claimed, commands, budget):
+        shop = turn.shop_pos()
+        if shop is not None and distance(role.pos, shop) <= 1:
+            return price
+        return 0
+    return None
 
 
 def _try_use_summon(role: Unit, commands: dict[int, dict[str, Any]]) -> bool:
@@ -1121,7 +1167,7 @@ def _buy_or_walk(
 def _wanted_purchase(
     turn: Turn, role: Unit, budget: int,
 ) -> tuple[str, int] | None:
-    """白天购货顺序：基地保命 → 武器升级券 → 墙券/修复 → 其它。"""
+    """白天购货顺序：武器升级（优先）→ 基地保命 → 墙券/修复 → 其它。"""
     weapons = turn.weapons()
     walls = turn.walls()
     station = turn.station()
@@ -1132,12 +1178,7 @@ def _wanted_purchase(
             return name, price
         return None
 
-    # 1) 基地是唯一硬性败负条件，先确保升到 L2。
-    if station is not None and station.level == 1:
-        item = can_buy(STATION_UPGRADE_1)
-        if item:
-            return item
-    # 2) 围墙建好后，金币优先买武器升级券并升级火力。
+    # 1) 有塔则火力升级最优先（每座 L1→L2 / L2→L3）
     if any(tower.level == 1 for tower in weapons):
         item = can_buy(WEAPON_UPGRADE_1)
         if item:
@@ -1146,13 +1187,18 @@ def _wanted_purchase(
         item = can_buy(WEAPON_UPGRADE_2)
         if item:
             return item
-    # 3) 再升级围墙与基地。
-    if any(wall.level == 1 for wall in walls):
-        item = can_buy(WALL_UPGRADE_1)
+    # 2) 基地保命升到 L2/L3
+    if station is not None and station.level == 1:
+        item = can_buy(STATION_UPGRADE_1)
         if item:
             return item
     if station is not None and station.level == 2:
         item = can_buy(STATION_UPGRADE_2)
+        if item:
+            return item
+    # 3) 再升级围墙
+    if any(wall.level == 1 for wall in walls):
+        item = can_buy(WALL_UPGRADE_1)
         if item:
             return item
     if any(wall.level == 2 for wall in walls):
@@ -1426,22 +1472,71 @@ def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
     return tuple(cells[:3])
 
 
-def _wall_ring(turn: Turn) -> tuple[Pos, ...]:
+def _base_is_northwest(turn: Turn) -> bool:
+    """基地在地图左上（挑战者常见）还是右下。"""
     station = turn.station()
     if station is None:
-        return ()
+        return True
+    return station.pos.x < turn.width // 2
+
+
+def _wall_face_cells(
+    turn: Turn,
+) -> tuple[list[Pos], list[Pos], list[Pos], list[Pos]]:
+    """按基地 2x2 外扩一圈，拆成 front/top/bottom/rear 四面。
+
+    左上基地：机器人从右往左打 → front=右墙；右下基地：从左往右 → front=左墙。
+    """
+    station = turn.station()
+    if station is None:
+        return [], [], [], []
     footprint = station_footprint(station.pos)
     xs = [pos.x for pos in footprint]
     ys = [pos.y for pos in footprint]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    ring = [
-        *(Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)),
-        *(Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)),
-        *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
-        *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 2, -1)),
-    ]
-    return tuple(pos for pos in ring if turn.land(pos))
+
+    bottom = [Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)]
+    left = [Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)]
+    top = [Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)]
+    right = [Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 2, -1)]
+
+    if _base_is_northwest(turn):
+        return right, top, bottom, left
+    return left, top, bottom, right
+
+
+def _half_toward_front(cells: list[Pos], northwest: bool) -> list[Pos]:
+    """上下墙只砌靠来敌一侧的一半长度。"""
+    if not cells:
+        return []
+    ordered = sorted(cells, key=lambda pos: (pos.x, pos.y))
+    half = max(1, (len(ordered) + 1) // 2)
+    if northwest:
+        # 来敌在右：取右半段
+        return ordered[-half:]
+    # 来敌在左：取左半段
+    return ordered[:half]
+
+
+def _wall_build_plan(turn: Turn) -> tuple[list[Pos], list[Pos], list[Pos]]:
+    """实际要砌的格子：来敌面全长 + 上下各一半（靠来敌侧）。"""
+    front, top, bottom, _rear = _wall_face_cells(turn)
+    nw = _base_is_northwest(turn)
+    return front, _half_toward_front(top, nw), _half_toward_front(bottom, nw)
+
+
+def _wall_ring(turn: Turn) -> tuple[Pos, ...]:
+    """来敌面全长 + 上下半墙，不含背面与远端半段。"""
+    front, top, bottom = _wall_build_plan(turn)
+    seen: set[Pos] = set()
+    out: list[Pos] = []
+    for pos in (*front, *top, *bottom):
+        if pos in seen or not turn.land(pos):
+            continue
+        seen.add(pos)
+        out.append(pos)
+    return tuple(out)
 
 
 def _ring_progress(turn: Turn) -> tuple[tuple[Pos, ...], float]:
@@ -1457,23 +1552,25 @@ def _ring_progress(turn: Turn) -> tuple[tuple[Pos, ...], float]:
 
 
 def _gate_cell(turn: Turn) -> Pos | None:
-    """只有在环形墙基本合围时才需要留出入口。"""
-    ring, progress = _ring_progress(turn)
-    if not ring or progress < 0.6:
-        return None
-    anchor = threat_anchor(turn)
-    return max(ring, key=lambda pos: (distance(pos, anchor), pos.x, pos.y))
+    """背面永久开口作出入口，不封第四面。"""
+    return None
 
 
 def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
-    """接口不给黄色可建造区域，所以理想环形位与已知合法墙的邻格一起当候选。
-
-    环形位离基地最近、排在前面；一旦判定为非法就进黑名单，
-    候选自然退化成沿现有围墙向外生长，逐步逼近真实的黄色区域。
-    """
+    """建造顺序：来敌面全长 → 上半墙 → 下半墙；完成后才去升级武器。"""
+    del seal
     station = turn.station()
     if station is None:
         return ()
+    front, top, bottom = _wall_build_plan(turn)
+    face_rank: dict[Pos, int] = {}
+    for pos in front:
+        face_rank[pos] = 0
+    for pos in top:
+        face_rank.setdefault(pos, 1)
+    for pos in bottom:
+        face_rank.setdefault(pos, 2)
+
     ring = _wall_ring(turn)
     seeds = wall_zone_seeds()
     frontier = {
@@ -1481,16 +1578,26 @@ def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
         if turn.land(pos) and pos not in seeds
     }
     banned = bad_build_cells()
-    gate = None if seal else _gate_cell(turn)
     anchor = threat_anchor(turn)
     footprint = station_footprint(station.pos)
+    core = set(face_rank)
 
-    candidates = [
-        pos for pos in {*ring, *frontier}
-        if pos not in banned and pos != gate
-    ]
-    candidates.sort(
+    filtered: list[Pos] = []
+    for pos in {*ring, *frontier}:
+        if pos in banned:
+            continue
+        # 只收核心计划内格子，或紧贴核心、仍靠来敌侧的邻格（黄区试探）
+        if pos in core:
+            filtered.append(pos)
+            continue
+        if pos not in frontier:
+            continue
+        if any(distance(pos, cell) <= 1 for cell in core):
+            filtered.append(pos)
+
+    filtered.sort(
         key=lambda pos: (
+            face_rank.get(pos, 3),
             0 if pos in ring else 1,
             distance(pos, anchor),
             _footprint_distance(pos, footprint),
@@ -1498,7 +1605,7 @@ def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
             pos.y,
         ),
     )
-    return tuple(candidates[:40])
+    return tuple(dict.fromkeys(filtered))[:20]
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:

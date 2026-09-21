@@ -327,6 +327,12 @@ def _observe_threat(turn: Turn) -> None:
 def threat_anchor(turn: Turn) -> Pos:
     if MEM.threat_n >= 8:
         return Pos(MEM.threat_x // MEM.threat_n, MEM.threat_y // MEM.threat_n)
+    station = turn.station()
+    if station is not None:
+        # 左上基地：机器人从右往左；右下基地：从左往右
+        if station.pos.x < turn.width // 2:
+            return Pos(turn.width - 1, station.pos.y)
+        return Pos(0, station.pos.y)
     return Pos(turn.width // 2, turn.height // 2)
 
 
