@@ -1,4 +1,4 @@
-"""自进化任务：优先接取，沙盒探索，沉淀 SOP，复用求解。"""
+"""自进化任务：沙盒探测 → 观测纠错 → 交卷，并沉淀可复用 SOP。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 from .intel import (
     MEM,
@@ -33,7 +34,7 @@ _PATH_LIKE = re.compile(
     re.I,
 )
 _EXPLORE_CMD = re.compile(
-    r"^(pwd|ls\b|find\b|test -f|sed -n|python3 - <<)",
+    r"^(pwd|ls\b|find\b|test -f|sed -n)",
     re.I,
 )
 _FILE_HINT = re.compile(
@@ -44,102 +45,33 @@ _SAFE_BLOCK = re.compile(
     r"rm\s+-rf|shutdown|reboot|mkfs|dd\s+if=|:\(\)\s*\{",
     re.I,
 )
-
-# 敌方已验证可交卷的城市文物题模板；同类题按城市名直接填表。
-_CITY_HERITAGE: dict[str, dict[str, Any]] = {
-    "北京": {
-        "city": "北京",
-        "total_count": 15,
-        "world_heritage_count": 6,
-        "types": [
-            "建筑", "园林", "陵墓", "军事防御", "遗址",
-            "宗教建筑", "教育建筑", "桥梁", "城门",
-        ],
-        "oldest_era": "周口店遗址",
-    },
-    "南京": {
-        "city": "南京",
-        "total_count": 12,
-        "world_heritage_count": 1,
-        "types": [
-            "陵墓", "建筑群", "军事防御", "建筑",
-            "宗教建筑", "园林", "纪念地",
-        ],
-        "oldest_era": "鸡鸣寺",
-    },
-    "成都": {
-        "city": "成都",
-        "total_count": 10,
-        "world_heritage_count": 1,
-        "types": [
-            "祠堂", "园林", "遗址", "水利工程",
-            "宗教建筑", "建筑", "街区", "陵墓",
-        ],
-        "oldest_era": "金沙遗址",
-    },
-    "上海": {
-        "city": "上海",
-        "total_count": 8,
-        "world_heritage_count": 0,
-        "types": ["建筑", "园林", "宗教建筑", "纪念地", "街区"],
-        "oldest_era": "龙华寺",
-    },
-    "杭州": {
-        "city": "杭州",
-        "total_count": 9,
-        "world_heritage_count": 1,
-        "types": ["园林", "湖泊", "寺庙", "建筑", "遗址"],
-        "oldest_era": "良渚遗址",
-    },
-    "西安": {
-        "city": "西安",
-        "total_count": 14,
-        "world_heritage_count": 2,
-        "types": ["陵墓", "城墙", "宗教建筑", "遗址", "建筑"],
-        "oldest_era": "半坡遗址",
-    },
-    "广州": {
-        "city": "广州",
-        "total_count": 7,
-        "world_heritage_count": 0,
-        "types": ["建筑", "宗教建筑", "园林", "纪念地"],
-        "oldest_era": "南越王墓",
-    },
-    "武汉": {
-        "city": "武汉",
-        "total_count": 6,
-        "world_heritage_count": 0,
-        "types": ["建筑", "宗教建筑", "纪念地", "桥梁"],
-        "oldest_era": "盘龙城遗址",
-    },
-    "重庆": {
-        "city": "重庆",
-        "total_count": 6,
-        "world_heritage_count": 0,
-        "types": ["建筑", "遗址", "宗教建筑", "纪念地"],
-        "oldest_era": "白鹤梁",
-    },
-    "深圳": {
-        "city": "深圳",
-        "total_count": 4,
-        "world_heritage_count": 0,
-        "types": ["建筑", "园林", "纪念地"],
-        "oldest_era": "大鹏所城",
-    },
-}
-_CITY_ALIASES = {
-    "beijing": "北京", "nanjing": "南京", "chengdu": "成都",
-    "shanghai": "上海", "hangzhou": "杭州", "xian": "西安", "xi'an": "西安",
-    "guangzhou": "广州", "wuhan": "武汉", "chongqing": "重庆", "shenzhen": "深圳",
-}
-_LEARNED_CITIES: dict[str, dict[str, Any]] = {}
-# 敌方日志里 token 题干不一定含 token/令牌；认证/auth/裸 12 位 hex 也要交
 _TOKEN_HINT = re.compile(
     r"token|令牌|口令|认证码?|auth(?:entication|code)?|secret|passwd|"
     r"password|密钥|验证码|口令码|\bkey\b|凭证|校验码",
     re.I,
 )
 _HEX12 = re.compile(r"\b([a-fA-F0-9]{12})\b")
+_READ_TASK = re.compile(r"(?:请阅读|阅读|see|read)\s+(\S+\.md)", re.I)
+_TASK_MD = re.compile(r"(task[_-]\d+[_-][A-Za-z0-9_-]+\.md)", re.I)
+_SKIP_DIRS = (
+    "lib", "boot", "run", "sbin", "var", "sys", "bin", "etc",
+    "dev", "usr", "lib64", "proc",
+)
+_CITY_EN = {
+    "beijing": "北京", "nanjing": "南京", "chengdu": "成都",
+    "shanghai": "上海", "hangzhou": "杭州", "xian": "西安", "xi'an": "西安",
+    "guangzhou": "广州", "wuhan": "武汉", "chongqing": "重庆", "shenzhen": "深圳",
+}
+_CITY_CN = (
+    "北京", "上海", "广州", "深圳", "杭州", "成都", "重庆", "武汉", "西安", "南京",
+    "天津", "苏州", "长沙", "郑州", "青岛", "厦门", "福州", "合肥", "南昌", "昆明",
+    "哈尔滨", "沈阳", "大连", "济南", "石家庄", "太原", "南宁", "海口", "贵阳", "兰州",
+    "银川", "西宁", "呼和浩特", "乌鲁木齐", "拉萨",
+)
+_ERA_RANK = (
+    "旧石器", "新石器", "史前", "商周", "商", "周", "春秋", "战国", "秦", "汉",
+    "三国", "晋", "南北朝", "隋", "唐", "五代", "宋", "元", "明", "清", "民国", "现代",
+)
 
 
 @dataclass
@@ -151,31 +83,66 @@ class Skill:
     good_cmds: list[str] = field(default_factory=list)
     last_answer: str = ""
     sandbox_notes: str = ""
+    steps: str = ""
+
+
+@dataclass
+class HttpSop:
+    url: str = "http://localhost:8899/api/v1/heritage/search"
+    api_key: str = "heritage-api-key-2024"
+    auth: str = ""
+    param: str = ""
 
 
 @dataclass
 class EvolveState:
     family: str = ""
+    kind: str = ""
     explore_i: int = 0
     last_cmd: str = ""
     last_sandbox: str = ""
     asked_llm: bool = False
     reused_skill: bool = False
+    task_file: str = ""
+    task_path: str = ""
+    bundle: str = ""
+    city: str = ""
+    app_name: str = ""
+    ws_dir: str = ""
+    http_done: bool = False
+    ws_done: bool = False
+    boot_done: bool = False
 
 
 _SKILLS: dict[str, Skill] = {}
 _STATE = EvolveState()
+_HTTP_SOP = HttpSop()
+_LEARNED_CITIES: dict[str, dict[str, Any]] = {}
 
 
 def reset() -> None:
     _SKILLS.clear()
     _LEARNED_CITIES.clear()
+    _HTTP_SOP.auth = ""
+    _HTTP_SOP.param = ""
+    _HTTP_SOP.url = "http://localhost:8899/api/v1/heritage/search"
+    _HTTP_SOP.api_key = "heritage-api-key-2024"
     _STATE.family = ""
+    _STATE.kind = ""
     _STATE.explore_i = 0
     _STATE.last_cmd = ""
     _STATE.last_sandbox = ""
     _STATE.asked_llm = False
     _STATE.reused_skill = False
+    _STATE.task_file = ""
+    _STATE.task_path = ""
+    _STATE.bundle = ""
+    _STATE.city = ""
+    _STATE.app_name = ""
+    _STATE.ws_dir = ""
+    _STATE.http_done = False
+    _STATE.ws_done = False
+    _STATE.boot_done = False
 
 
 def on_task_text(task: str) -> None:
@@ -183,23 +150,36 @@ def on_task_text(task: str) -> None:
     family = task_family(task)
     if family != _STATE.family:
         _STATE.family = family
+        _STATE.kind = _classify(task)
         _STATE.explore_i = 0
         _STATE.last_cmd = ""
         _STATE.last_sandbox = ""
         _STATE.asked_llm = False
         _STATE.reused_skill = False
+        _STATE.task_file = _task_filename(task)
+        _STATE.task_path = ""
+        _STATE.bundle = ""
+        _STATE.city = _detect_city(task) or ""
+        _STATE.app_name = _detect_app(task)
+        _STATE.ws_dir = ""
+        _STATE.http_done = False
+        _STATE.ws_done = False
+        _STATE.boot_done = False
         MEM.awaiting_task = False
 
 
 def task_family(text: str) -> str:
-    """把同类变体（换城市/文件名）归到同一 family，便于 SOP 复用。"""
+    """按题型归族，便于 SOP 复用（城市/应用名视为同一族变体）。"""
+    kind = _classify(text)
+    if kind:
+        return kind
     raw = (text or "").strip().lower()
     if not raw:
         return ""
     normalized = re.sub(r"\d+", "#", raw)
     normalized = re.sub(
         r"(北京|上海|广州|深圳|杭州|成都|重庆|武汉|西安|南京|"
-        r"beijing|shanghai|guangzhou|shenzhen|hangzhou)",
+        r"beijing|shanghai|guangzhou|shenzhen|hangzhou|chengdu|nanjing)",
         "<city>",
         normalized,
         flags=re.I,
@@ -211,20 +191,37 @@ def task_family(text: str) -> str:
     return f"{digest}:{tip}"
 
 
-def should_prioritize(turn: Turn) -> bool:
-    """能接/能做自进化任务时优先去做（白天临近入夜除外，夜间可持续刷）。
+def _classify(text: str) -> str:
+    raw = text or ""
+    low = raw.lower()
+    if re.search(
+        r"engineering-fix|修复应用|部署问题|ws_\d|"
+        r"task_\d+_(alpha|beta|gamma|delta)",
+        low,
+        re.I,
+    ):
+        return "engineering-fix"
+    if re.search(
+        r"unknown-api|heritage|文物|文化遗产|nchda|"
+        r"localhost:\d+|task_\d+_(beijing|nanjing|chengdu|shanghai|hangzhou)",
+        low,
+        re.I,
+    ):
+        return "unknown-api"
+    if _detect_city(raw) and re.search(r"查询|统计|api|http", raw, re.I):
+        return "unknown-api"
+    return ""
 
-    敌方同款：冷却期也持续刷 accept，不因 skip/无就绪任务而长时间放弃。
-    """
+
+def should_prioritize(turn: Turn) -> bool:
+    """能接/能做自进化任务时优先去做（白天临近入夜除外，夜间可持续刷）。"""
     if turn.phase_task.strip():
         return True
     if turn.is_day and turn.near_night:
         return False
-    # 有就绪任务 → 立刻去；否则仍去任务点刷 accept（冷却期无效也刷）
     if turn.available_tasks():
         return True
     if turn.round_no < MEM.skip_task_until:
-        # 刚超时后短暂冷却，但仍允许靠近任务点刷 accept
         return bool(turn.our_task_points() or turn.tasks)
     return bool(turn.our_task_points() or turn.tasks)
 
@@ -263,15 +260,24 @@ def solve(
     family = _STATE.family or task_family(task)
     skill = _SKILLS.setdefault(family, Skill(family=family))
 
-    # 0) 本地 SOP / 预设：敌方同款「接完立刻交」路线
-    preset = try_preset_answer(task, skill)
-    if preset and not is_junk_answer(preset):
-        payload = patch_task_answer(preset, turn)
-        _commit_answer(role, commands, payload, skill)
-        _learn_from_answer(payload)
-        return "", ""
+    # 1) 消化沙盒：bundle / HTTP / check TOKEN / 显式 ANSWER
+    raw_result = turn.last_cmd_result.strip()
+    if raw_result:
+        _STATE.last_sandbox = _clip(raw_result, 3500)
+        skill.sandbox_notes = _STATE.last_sandbox[-1500:]
+        _ingest_sandbox(raw_result, task, skill)
+        concrete = _answer_from_sandbox(raw_result, task)
+        if concrete and not is_junk_answer(concrete):
+            payload = patch_task_answer(concrete, turn)
+            if _STATE.last_cmd and not _is_explore_cmd(_STATE.last_cmd):
+                if _STATE.last_cmd not in skill.good_cmds:
+                    skill.good_cmds.append(_STATE.last_cmd)
+            _commit_answer(role, commands, payload, skill)
+            _learn_from_answer(payload)
+            _learn_sop(skill)
+            return "", ""
 
-    # 1) 消化 LLM 回复
+    # 2) 消化 LLM：只接受 ANSWER / CMD，绝不把元描述当答案
     resp = turn.llm_resp.strip()
     if resp and MEM.awaiting_task:
         answer = _extract_tag(resp, "ANSWER")
@@ -281,42 +287,25 @@ def solve(
             _learn_from_answer(payload)
             return "", ""
         cmd = _extract_tag(resp, "CMD")
-        if cmd:
+        if cmd and "workspace_edit" not in cmd:
             MEM.awaiting_task = False
             _STATE.asked_llm = False
             safe = safe_cmd(cmd)
             _STATE.last_cmd = safe
-            if safe not in skill.good_cmds and not _is_explore_cmd(safe):
-                skill.good_cmds.append(safe)
             return "", safe
-        # LLM 给了垃圾答案：丢掉等待态，继续探索/重问
-        if answer and is_junk_answer(answer):
-            MEM.awaiting_task = False
-            _STATE.asked_llm = False
+        MEM.awaiting_task = False
+        _STATE.asked_llm = False
 
-    # 2) 消化上轮沙盒输出：只接受显式 ANSWER:/JSON，绝不把 ls/find 路径当答案
-    raw_result = turn.last_cmd_result.strip()
-    if raw_result:
-        _STATE.last_sandbox = _clip(raw_result, 2500)
-        skill.sandbox_notes = _STATE.last_sandbox[-1200:]
-        concrete = concrete_sandbox_answer(raw_result)
-        if not concrete:
-            # token：沙盒抽出 hex 即交，不再要求题干含 token/令牌（敌方同款）
-            token = _extract_token(raw_result)
-            if token and (_is_token_context(task) or _HEX12.search(raw_result)):
-                concrete = json.dumps(
-                    {"token": token}, ensure_ascii=False, separators=(",", ":"),
-                )
-        if concrete and not is_junk_answer(concrete):
-            payload = patch_task_answer(concrete, turn)
-            if _STATE.last_cmd and not _is_explore_cmd(_STATE.last_cmd):
-                if _STATE.last_cmd not in skill.good_cmds:
-                    skill.good_cmds.append(_STATE.last_cmd)
+    # 3) 题干里直接嵌了完整答案（短任务，非「请阅读 md」）才秒交
+    if not _is_read_file_task(task):
+        preset = try_preset_answer(task, skill)
+        if preset and not is_junk_answer(preset):
+            payload = patch_task_answer(preset, turn)
             _commit_answer(role, commands, payload, skill)
             _learn_from_answer(payload)
             return "", ""
 
-    # 3) 判题缺键：就地修补再交（跳过垃圾旧答案）
+    # 4) 判题缺键：就地修补再交
     if MEM.task_fails and (MEM.task_required or MEM.task_forbidden) and MEM.task_answer:
         if not is_junk_answer(MEM.task_answer):
             payload = patch_task_answer(MEM.task_answer, turn)
@@ -324,23 +313,16 @@ def solve(
                 _commit_answer(role, commands, payload, skill)
                 return "", ""
 
-    # 4) 复用已有 SOP：同类题直接跑沉淀命令（排除探索命令）
-    usable = [cmd for cmd in skill.good_cmds if not _is_explore_cmd(cmd)]
-    if not _STATE.reused_skill and usable:
-        cmd = _adapt_cmd(usable[-1], task, skill)
-        _STATE.reused_skill = True
-        _STATE.last_cmd = cmd
-        return "", cmd
+    # 5) 按族探测：bootstrap → HTTP/workspace（含报错自纠）
+    probe = next_probe_cmd(task, skill)
+    if probe:
+        _STATE.last_cmd = probe
+        if probe not in skill.explore_cmds:
+            skill.explore_cmds.append(probe)
+        MEM.awaiting_task = False
+        return "", probe
 
-    # 5) 确定性沙盒探索（不依赖 LLM）
-    boot = next_bootstrap_cmd(task, skill)
-    if boot:
-        _STATE.last_cmd = boot
-        if boot not in skill.explore_cmds:
-            skill.explore_cmds.append(boot)
-        return "", boot
-
-    # 6) 快超时保底
+    # 6) 快超时保底：只用沙盒证据，不用写死城市库
     if force_submit_now(turn):
         payload = patch_task_answer(_fallback_answer(turn), turn)
         if payload and not is_junk_answer(payload):
@@ -351,7 +333,7 @@ def solve(
             _commit_answer(role, commands, payload, skill)
             return "", ""
 
-    # 7) 问 LLM（任务期间不占每日额度）
+    # 7) 问 LLM（任务期间不占每日额度）；禁止它输出 workspace_edit
     if not MEM.awaiting_task:
         MEM.prompted_task = task
         MEM.awaiting_task = True
@@ -359,84 +341,39 @@ def solve(
         mark_prompt(turn)
         return build_prompt(turn, skill), ""
 
-    # 8) 等待 LLM 时空转修复：再扫预设 / 再探沙盒 / 周期性重问，禁止空回合
-    retry_preset = try_preset_answer(task, skill)
-    if retry_preset and not is_junk_answer(retry_preset):
-        payload = patch_task_answer(retry_preset, turn)
-        _commit_answer(role, commands, payload, skill)
-        _learn_from_answer(payload)
-        return "", ""
-    boot = next_bootstrap_cmd(task, skill)
-    if boot:
-        _STATE.last_cmd = boot
-        if boot not in skill.explore_cmds:
-            skill.explore_cmds.append(boot)
-        MEM.awaiting_task = False
-        return "", boot
     used = task_rounds_used(turn)
-    if used > 0 and used % 4 == 0:
+    if used > 0 and used % 3 == 0:
+        probe = next_probe_cmd(task, skill)
+        if probe:
+            MEM.awaiting_task = False
+            _STATE.last_cmd = probe
+            return "", probe
         mark_prompt(turn)
         return build_prompt(turn, skill), ""
     return "", ""
 
 
-def next_bootstrap_cmd(task: str, skill: Skill) -> str | None:
-    steps: list[str] = []
+def next_probe_cmd(task: str, skill: Skill) -> str | None:
+    kind = _STATE.kind or _classify(task) or _classify(_STATE.bundle)
+    if not _STATE.boot_done:
+        _STATE.boot_done = True
+        return _bootstrap_cmd(task)
+
+    if kind == "unknown-api" and not _STATE.http_done:
+        _STATE.http_done = True
+        city = _STATE.city or _detect_city(_STATE.bundle or task) or "北京"
+        return _http_probe_cmd(city)
+
+    if kind == "engineering-fix" and not _STATE.ws_done:
+        _STATE.ws_done = True
+        return _workspace_fix_cmd(task)
+
+    # 未知题型：读点名文件 / 目录
     files = _FILE_HINT.findall(task)
-    low = task.lower()
-
-    # token 题：优先在题目点名文件和常见位置搜十六进制
-    if _is_token_context(task):
-        steps.append(
-            "python3 - <<'PY'\n"
-            "import re, pathlib\n"
-            "pat = re.compile(r'[a-fA-F0-9]{8,32}')\n"
-            "hits = []\n"
-            "for p in pathlib.Path('.').rglob('*'):\n"
-            "    if not p.is_file() or p.stat().st_size > 200000: continue\n"
-            "    if any(x in p.parts for x in ('proc','sys','dev')): continue\n"
-            "    try: text = p.read_text(encoding='utf-8', errors='ignore')\n"
-            "    except Exception: continue\n"
-            "    for m in pat.findall(text):\n"
-            "        if len(m) >= 8: hits.append(m)\n"
-            "        if len(hits) >= 5: break\n"
-            "    if len(hits) >= 5: break\n"
-            "print('ANSWER:' + (hits[0] if hits else ''))\n"
-            "PY"
-        )
-        steps.append(
-            "grep -RhoE '[a-fA-F0-9]{12,32}' . --exclude-dir=proc "
-            "--exclude-dir=sys --exclude-dir=dev 2>/dev/null | head -5"
-        )
-
-    # 城市文物题：找数据文件
-    if any(city in task for city in _CITY_HERITAGE) or "heritage" in low or "文物" in task:
-        steps.append(
-            "python3 - <<'PY'\n"
-            "import json, pathlib, re\n"
-            "for p in pathlib.Path('.').rglob('*'):\n"
-            "    if not p.is_file() or p.suffix.lower() not in {'.json','.md','.txt','.csv'}: continue\n"
-            "    if any(x in p.parts for x in ('proc','sys','dev')): continue\n"
-            "    try: text = p.read_text(encoding='utf-8', errors='ignore')\n"
-            "    except Exception: continue\n"
-            "    if 'total_count' in text or 'world_heritage' in text or 'oldest_era' in text:\n"
-            "        print(p); print(text[:2000]); break\n"
-            "PY"
-        )
-
-    # 先读题目点名的文档，再做目录枚举
+    steps: list[str] = []
     for name in files:
         steps.append(f"sed -n '1,240p' {name} 2>/dev/null || cat {name}")
-    for name in ("API_DOCS.md", "README.md", "api.md", "docs.md", "task.md", "data.json"):
-        if name.lower() not in {f.lower() for f in files}:
-            steps.append(f"test -f {name} && sed -n '1,240p' {name}")
-    steps.append("pwd; ls -la")
-    steps.append(
-        "find . -maxdepth 2 -type f "
-        "! -path './proc/*' ! -path './sys/*' ! -path './dev/*' "
-        "2>/dev/null | head -40"
-    )
-
+    steps.append(_generic_scan_cmd())
     while _STATE.explore_i < len(steps):
         cmd = steps[_STATE.explore_i]
         _STATE.explore_i += 1
@@ -446,55 +383,49 @@ def next_bootstrap_cmd(task: str, skill: Skill) -> str | None:
     return None
 
 
-def try_preset_answer(task: str, skill: Skill) -> str:
-    """不调 LLM/沙盒也能交的确定性 SOP。"""
-    # 1) 题目里直接嵌了完整 JSON
-    for match in re.finditer(r"\{[^{}]{3,800}\}", task):
-        blob = match.group(0)
-        try:
-            data = json.loads(blob)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and data:
-            return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+def next_bootstrap_cmd(task: str, skill: Skill) -> str | None:
+    """兼容旧测试入口，转交探测队列。"""
+    return next_probe_cmd(task, skill)
 
-    # 2) token 题：题干自带 hex（关键词放宽；裸 12 位也交）
+
+def try_preset_answer(task: str, skill: Skill) -> str:
+    """仅当题干本身已给出可交答案时使用；不写死城市文物表。"""
+    del skill
+    if _is_read_file_task(task):
+        return ""
+    # 题目里直接嵌了完整 JSON，且不像「输出格式示例」
+    if "```" not in task and "如下" not in task:
+        for match in re.finditer(r"\{[^{}]{3,800}\}", task):
+            blob = match.group(0)
+            try:
+                data = json.loads(blob)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and data and (
+                "token" in data or "total_count" in data or len(data) >= 2
+            ):
+                return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
     if _is_token_context(task):
         token = _extract_token(task)
         if token:
             return json.dumps(
                 {"token": token}, ensure_ascii=False, separators=(",", ":"),
             )
-
-    # 3) 城市文物题：本地库 / 本局学到的库
-    city = _detect_city(task)
-    if city:
-        data = _LEARNED_CITIES.get(city) or _CITY_HERITAGE.get(city)
-        if data:
-            payload = dict(data)
-            payload["city"] = city
-            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        # 有同类题上次答案时，替换城市名再交
-        if skill.last_answer and skill.last_answer.startswith("{"):
-            try:
-                prev = json.loads(skill.last_answer)
-            except json.JSONDecodeError:
-                prev = None
-            if isinstance(prev, dict) and prev:
-                prev = dict(prev)
-                prev["city"] = city
-                return json.dumps(prev, ensure_ascii=False, separators=(",", ":"))
-
     return ""
 
 
+def _is_read_file_task(task: str) -> bool:
+    return bool(_READ_TASK.search(task) or _TASK_MD.search(task))
+
+
 def _is_token_context(task: str) -> bool:
-    """是否应按 token 题处理（敌方日志：不一定出现 token 字样）。"""
     if not task or not task.strip():
+        return False
+    if _is_read_file_task(task):
         return False
     if _TOKEN_HINT.search(task):
         return True
-    # 短题干里单独出现 12 位 hex，且不像城市文物题
     if _HEX12.search(task):
         if _detect_city(task):
             return False
@@ -506,26 +437,53 @@ def _is_token_context(task: str) -> bool:
 
 
 def _detect_city(task: str) -> str | None:
-    for city in _CITY_HERITAGE:
-        if city in task:
-            return city
+    if not task:
+        return None
     low = task.lower()
-    for alias, city in _CITY_ALIASES.items():
+    match = _TASK_MD.search(task)
+    if match:
+        stem = match.group(1).lower()
+        for alias, city in _CITY_EN.items():
+            if alias in stem:
+                return city
+    for alias, city in _CITY_EN.items():
         if alias in low:
             return city
-    match = re.search(
-        r"(北京|上海|广州|深圳|杭州|成都|重庆|武汉|西安|南京|"
-        r"天津|苏州|长沙|郑州|青岛|厦门|福州|合肥|南昌|昆明|"
-        r"哈尔滨|沈阳|大连|济南|石家庄|太原|南宁|海口|贵阳|兰州|"
-        r"银川|西宁|呼和浩特|乌鲁木齐|拉萨)",
-        task,
-    )
-    return match.group(1) if match else None
+    for city in _CITY_CN:
+        if city in task:
+            return city
+    return None
+
+
+def _detect_app(task: str) -> str:
+    match = re.search(r"task_\d+_([A-Za-z]+)\.md", task or "", re.I)
+    if match:
+        name = match.group(1).lower()
+        if name not in _CITY_EN:
+            return name
+    match = re.search(r"应用\s*[`'\"]?([A-Za-z][A-Za-z0-9_-]*)", task or "")
+    if match:
+        return match.group(1).lower()
+    match = re.search(r"\b(alpha|beta|gamma|delta|omega)\b", task or "", re.I)
+    if match:
+        return match.group(1).lower()
+    return ""
+
+
+def _task_filename(task: str) -> str:
+    match = _READ_TASK.search(task) or _TASK_MD.search(task)
+    if match:
+        return match.group(1)
+    files = _FILE_HINT.findall(task or "")
+    return files[0] if files else ""
 
 
 def _extract_token(text: str) -> str:
     if not text:
         return ""
+    match = re.search(r"TOKEN\s*[:：]\s*([a-fA-F0-9]{8,32})", text, re.I)
+    if match:
+        return match.group(1).lower()
     patterns = (
         r'["\']?(?:token|auth|secret|key|令牌|口令|认证码?|密钥|验证码)'
         r'["\']?\s*[:=：]\s*["\']([a-fA-F0-9]{8,32})["\']',
@@ -537,14 +495,146 @@ def _extract_token(text: str) -> str:
         r"\b([a-fA-F0-9]{8})\b",
     )
     for pat in patterns:
-        match = re.search(pat, text, re.I)
-        if match:
-            return match.group(1).lower()
-    # 兜底：全文第一个 12 位 hex
-    match = _HEX12.search(text)
-    if match:
-        return match.group(1).lower()
+        found = re.search(pat, text, re.I)
+        if found:
+            return found.group(1).lower()
+    found = _HEX12.search(text)
+    return found.group(1).lower() if found else ""
+
+
+def _ingest_sandbox(raw: str, task: str, skill: Skill) -> None:
+    bundle = _extract_tagged_json(raw, "FWBUNDLE1")
+    if bundle:
+        _STATE.boot_done = True
+        _STATE.task_path = str(bundle.get("task_path") or "")
+        _STATE.bundle = str(bundle.get("task") or "")
+        blob = _STATE.bundle or task
+        _STATE.kind = _STATE.kind or _classify(blob) or _classify(_STATE.task_path)
+        _STATE.city = _STATE.city or _detect_city(blob) or _detect_city(_STATE.task_path) or ""
+        _STATE.app_name = _STATE.app_name or _detect_app(blob) or _detect_app(_STATE.task_path)
+        ws = re.search(r"(?:ws_\d+|/tmp/\S+?/(ws_\d+))", blob + " " + _STATE.task_path)
+        if ws:
+            _STATE.ws_dir = ws.group(1) if ws.lastindex else ws.group(0)
+        url = re.search(r"https?://127\.0\.0\.1:\d+\S*|https?://localhost:\d+\S*", blob)
+        if url:
+            base = url.group(0).split("?")[0]
+            if "heritage" in base or "api" in base:
+                _HTTP_SOP.url = base.rstrip("/")
+        key = re.search(r"(heritage-api-key-\d+|[A-Za-z0-9_-]{12,40})", blob)
+        if key and "api-key" in key.group(1).lower():
+            _HTTP_SOP.api_key = key.group(1)
+
+    http = _extract_tagged_json(raw, "FWHTTP1")
+    if http:
+        _STATE.http_done = True
+        status = int(http.get("status") or 0)
+        body = str(http.get("body") or "")
+        if status == 401 and "Bearer" in body:
+            _HTTP_SOP.auth = "bearer"
+        if status == 400 and "location" in body.lower():
+            _HTTP_SOP.param = "location"
+        if http.get("ok") and status in {0, 200}:
+            _HTTP_SOP.auth = _HTTP_SOP.auth or "bearer"
+            _HTTP_SOP.param = _HTTP_SOP.param or "location"
+            skill.steps = "LOCAL_HTTP"
+
+    if re.search(r"\[\s*OK\s*\]|全部通过|TOKEN\s*:", raw, re.I):
+        skill.steps = "WORKSPACE_EDIT>VERIFY"
+
+
+def _answer_from_sandbox(raw: str, task: str) -> str:
+    token = _extract_token(raw)
+    if token and (
+        re.search(r"\[\s*OK\s*\]|全部通过|TOKEN\s*:", raw, re.I)
+        or _STATE.kind == "engineering-fix"
+        or _is_token_context(task)
+    ):
+        return json.dumps({"token": token}, ensure_ascii=False, separators=(",", ":"))
+
+    tagged = _extract_tagged_json(raw, "FWHTTP1")
+    if tagged and (tagged.get("ok") or int(tagged.get("status") or 0) == 200):
+        city = _STATE.city or _detect_city(task) or ""
+        stats = _heritage_stats(str(tagged.get("body") or ""), city)
+        if stats:
+            return stats
+
+    concrete = concrete_sandbox_answer(raw)
+    if concrete:
+        return concrete
     return ""
+
+
+def _heritage_stats(body: str, city: str) -> str:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return ""
+    records = _records_of(data)
+    if not records:
+        return ""
+    types: list[str] = []
+    world = 0
+    oldest_name = ""
+    oldest_rank = 10**6
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or item.get("types") or "")
+        if kind and kind not in types:
+            types.append(kind)
+        level = str(item.get("protected_level") or item.get("level") or "")
+        if "世界遗产" in level:
+            world += 1
+        era = str(item.get("era") or item.get("oldest_era") or "")
+        rank = _era_rank(era)
+        name = str(item.get("name") or "")
+        if name and rank < oldest_rank:
+            oldest_rank = rank
+            oldest_name = name
+    payload = {
+        "city": city or str(data.get("city") or ""),
+        "total_count": len(records),
+        "world_heritage_count": world,
+        "types": types,
+        "oldest_era": oldest_name,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _records_of(data: Any) -> list[Any]:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        rec = inner.get("records") or inner.get("items") or inner.get("list")
+        if isinstance(rec, list):
+            return rec
+    rec = data.get("records") or data.get("items") or data.get("list")
+    return rec if isinstance(rec, list) else []
+
+
+def _era_rank(era: str) -> int:
+    for index, name in enumerate(_ERA_RANK):
+        if name and name in era:
+            return index
+    return 10**6
+
+
+def _extract_tagged_json(raw: str, tag: str) -> dict[str, Any] | None:
+    match = re.search(rf"{tag}\s+(\{{.*)", raw, re.S)
+    if not match:
+        return None
+    blob = match.group(1).strip()
+    for end in range(len(blob), 1, -1):
+        try:
+            data = json.loads(blob[:end])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def _learn_from_answer(payload: str) -> None:
@@ -559,6 +649,224 @@ def _learn_from_answer(payload: str) -> None:
     city = str(data.get("city") or "")
     if city and ("total_count" in data or "types" in data or "oldest_era" in data):
         _LEARNED_CITIES[city] = dict(data)
+
+
+def _learn_sop(skill: Skill) -> None:
+    if _STATE.kind == "unknown-api":
+        skill.steps = "LOCAL_HTTP"
+        if not _HTTP_SOP.auth:
+            _HTTP_SOP.auth = "bearer"
+        if not _HTTP_SOP.param:
+            _HTTP_SOP.param = "location"
+    elif _STATE.kind == "engineering-fix":
+        skill.steps = "WORKSPACE_EDIT>VERIFY"
+
+
+def _bootstrap_cmd(task: str) -> str:
+    filename = _STATE.task_file or _task_filename(task) or "task.md"
+    skip = ",".join(repr(name) for name in _SKIP_DIRS)
+    return (
+        "python3 - <<'PY'\n"
+        "import json, pathlib\n"
+        f"fn = {filename!r}\n"
+        f"skip = {{{skip}}}\n"
+        "found = None\n"
+        "for p in pathlib.Path('.').rglob(fn):\n"
+        "    if p.is_file() and not (set(p.parts) & skip):\n"
+        "        found = p; break\n"
+        "if found is None:\n"
+        "    for p in pathlib.Path('.').rglob('task*.md'):\n"
+        "        if p.is_file() and not (set(p.parts) & skip):\n"
+        "            found = p; break\n"
+        "text = found.read_text(encoding='utf-8', errors='ignore')[:7000] if found else ''\n"
+        "print('FWBUNDLE1 ' + json.dumps("
+        "{'ok': bool(found), 'task_path': str(found or ''), 'task': text}, "
+        "ensure_ascii=False))\n"
+        "PY"
+    )
+
+
+def _http_probe_cmd(city: str) -> str:
+    url = _HTTP_SOP.url
+    key = _HTTP_SOP.api_key
+    city_q = quote(city)
+    prefer_auth = _HTTP_SOP.auth or ""
+    prefer_param = _HTTP_SOP.param or ""
+    return (
+        "python3 - <<'PY'\n"
+        "import json, urllib.error, urllib.parse, urllib.request\n"
+        f"URL = {url!r}\n"
+        f"KEY = {key!r}\n"
+        f"CITY = {city!r}\n"
+        f"PREFER_AUTH = {prefer_auth!r}\n"
+        f"PREFER_PARAM = {prefer_param!r}\n"
+        "enc = urllib.parse.quote(CITY)\n"
+        "auths = []\n"
+        "if PREFER_AUTH == 'bearer':\n"
+        "    auths.append({'Authorization': 'Bearer ' + KEY})\n"
+        "auths += [{'X-API-Key': KEY}, {'Authorization': 'Bearer ' + KEY}, {}]\n"
+        "params = []\n"
+        "if PREFER_PARAM:\n"
+        "    params.append(PREFER_PARAM)\n"
+        "params += ['location', 'city', 'q']\n"
+        "seen=set(); auths=[a for a in auths if tuple(a.items()) not in seen and not seen.add(tuple(a.items()))]\n"
+        "seen=set(); params=[p for p in params if p not in seen and not seen.add(p)]\n"
+        "last = {'ok': False, 'status': 0, 'body': '', 'error': ''}\n"
+        "ok_body = ''\n"
+        "def fetch(headers, query):\n"
+        "    req = urllib.request.Request(URL + '?' + query, headers=headers)\n"
+        "    try:\n"
+        "        with urllib.request.urlopen(req, timeout=10) as resp:\n"
+        "            return resp.status, resp.read(80000).decode('utf-8', 'ignore'), ''\n"
+        "    except urllib.error.HTTPError as exc:\n"
+        "        return exc.code, exc.read(8000).decode('utf-8', 'ignore'), 'HTTPError'\n"
+        "    except Exception as exc:\n"
+        "        return 0, str(exc), type(exc).__name__\n"
+        "for headers in auths:\n"
+        "    for param in params:\n"
+        "        for extra in ('', '&page=1', '&offset=0&limit=100&page=1'):\n"
+        "            q = param + '=' + enc + extra\n"
+        "            status, body, err = fetch(headers, q)\n"
+        "            last = {'ok': 200 <= status < 300, 'status': status, 'body': body, 'error': err}\n"
+        "            print('FWHTTP1 ' + json.dumps(last, ensure_ascii=False)[:4000])\n"
+        "            if last['ok']:\n"
+        "                ok_body = body\n"
+        "                break\n"
+        "        if ok_body:\n"
+        "            break\n"
+        "    if ok_body:\n"
+        "        break\n"
+        "if ok_body:\n"
+        "    try: data = json.loads(ok_body)\n"
+        "    except Exception: data = {}\n"
+        "    rec = []\n"
+        "    if isinstance(data, dict):\n"
+        "        inner = data.get('data') if isinstance(data.get('data'), dict) else data\n"
+        "        rec = inner.get('records') or inner.get('items') or inner.get('list') or []\n"
+        "    if isinstance(rec, list) and rec:\n"
+        "        types=[]; world=0; oldest=''; rank=10**6\n"
+        "        eras=['旧石器','新石器','史前','商周','商','周','春秋','战国','秦','汉','三国','晋','南北朝','隋','唐','五代','宋','元','明','清','民国']\n"
+        "        for item in rec:\n"
+        "            if not isinstance(item, dict): continue\n"
+        "            k=str(item.get('type') or '')\n"
+        "            if k and k not in types: types.append(k)\n"
+        "            if '世界遗产' in str(item.get('protected_level') or ''): world += 1\n"
+        "            era=str(item.get('era') or ''); r=next((i for i,n in enumerate(eras) if n in era), 10**6)\n"
+        "            name=str(item.get('name') or '')\n"
+        "            if name and r < rank: rank=r; oldest=name\n"
+        "        ans={'city':CITY,'total_count':len(rec),'world_heritage_count':world,'types':types,'oldest_era':oldest}\n"
+        "        print('ANSWER:' + json.dumps(ans, ensure_ascii=False, separators=(',', ':')))\n"
+        "PY"
+    )
+
+
+def _workspace_fix_cmd(task: str) -> str:
+    filename = _STATE.task_file or _task_filename(task) or "task.md"
+    app = _STATE.app_name or "app"
+    hint_path = _STATE.task_path
+    return (
+        "python3 - <<'PY'\n"
+        "import json, os, pathlib, re, stat, subprocess, sys\n"
+        f"FN = {filename!r}\n"
+        f"APP = {app!r}\n"
+        f"HINT = {hint_path!r}\n"
+        "skip={'lib','boot','run','sbin','var','sys','bin','etc','dev','usr','lib64','proc'}\n"
+        "task=pathlib.Path(HINT) if HINT else None\n"
+        "if task is None or not task.is_file():\n"
+        "    for p in pathlib.Path('.').rglob(FN):\n"
+        "        if p.is_file() and not (set(p.parts)&skip):\n"
+        "            task=p; break\n"
+        "text = task.read_text(encoding='utf-8', errors='ignore') if task and task.is_file() else ''\n"
+        "app = APP\n"
+        "m = re.search(r'alpha|beta|gamma|delta|omega', (text+' '+str(task or FN)).lower())\n"
+        "if m: app = m.group(0)\n"
+        "ws=None\n"
+        "if task:\n"
+        "    base=task.parent\n"
+        "    m=re.search(r'ws_\\d+', text+' '+str(task))\n"
+        "    names=[]\n"
+        "    if m: names.append(m.group(0))\n"
+        "    names += ['ws_1','ws_2','ws_3', app]\n"
+        "    for name in names:\n"
+        "        cand=base/name\n"
+        "        if cand.is_dir():\n"
+        "            ws=cand; break\n"
+        "        hit=next((p for p in base.rglob(name) if p.is_dir()), None)\n"
+        "        if hit:\n"
+        "            ws=hit; break\n"
+        "    if ws is None:\n"
+        "        for p in base.iterdir():\n"
+        "            if p.is_dir() and ((p/'check').exists() or (p/'check.py').exists()):\n"
+        "                ws=p; break\n"
+        "print('ws', ws, 'app', app)\n"
+        "if ws is None:\n"
+        "    print('ANSWER:')\n"
+        "    raise SystemExit\n"
+        "logs=ws/'logs'/app\n"
+        "logs.mkdir(mode=0o755, parents=True, exist_ok=True)\n"
+        "os.chmod(logs, 0o755)\n"
+        "spec=''\n"
+        "for name in ('spec.md','SPEC.md','README.md'):\n"
+        "    p=ws/name\n"
+        "    if p.is_file(): spec += p.read_text(encoding='utf-8', errors='ignore')+'\\n'\n"
+        "blob=text+'\\n'+spec\n"
+        "conf=None\n"
+        "cfgdir=ws/'config'\n"
+        "for cand in [cfgdir/ (app+'.conf'), cfgdir/(app+'.cfg')]:\n"
+        "    if cand.is_file(): conf=cand; break\n"
+        "if conf is None and cfgdir.is_dir():\n"
+        "    files=list(cfgdir.glob('*.conf'))+list(cfgdir.glob('*.cfg'))\n"
+        "    conf=files[0] if files else None\n"
+        "if conf is not None:\n"
+        "    raw=conf.read_text(encoding='utf-8', errors='ignore')\n"
+        "    port=re.search(r'port\\s+(\\d+)', blob, re.I)\n"
+        "    svc=re.search(r'name\\s+([A-Za-z0-9_-]+)', blob, re.I)\n"
+        "    out=[]\n"
+        "    for line in raw.splitlines():\n"
+        "        if port and re.match(r'\\s*port\\b', line, re.I):\n"
+        "            out.append(re.sub(r'\\d+', port.group(1), line, count=1))\n"
+        "        elif svc and re.match(r'\\s*name\\b', line, re.I):\n"
+        "            out.append(re.sub(r'(name\\s+)\\S+', r'\\1'+svc.group(1), line, count=1, flags=re.I))\n"
+        "        else:\n"
+        "            out.append(line)\n"
+        "    conf.write_text('\\n'.join(out)+('\\n' if raw.endswith('\\n') else ''), encoding='utf-8')\n"
+        "start=ws/'bin'/'start.sh'\n"
+        "if start.is_file():\n"
+        "    os.chmod(start, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)\n"
+        "check=ws/'check.py' if (ws/'check.py').exists() else ws/'check'\n"
+        "token=''\n"
+        "if check.exists():\n"
+        "    head=check.read_bytes()[:120]\n"
+        "    if check.suffix=='.py' or (head.startswith(b'#!') and b'python' in head):\n"
+        "        cmd=[sys.executable, str(check)]\n"
+        "    else:\n"
+        "        cmd=[str(check)]\n"
+        "    try:\n"
+        "        proc=subprocess.run(cmd, cwd=str(ws), capture_output=True, text=True, timeout=20)\n"
+        "        out=(proc.stdout or '')+'\\n'+(proc.stderr or '')\n"
+        "        print(out)\n"
+        "        m=re.search(r'TOKEN\\s*[:：]\\s*([a-fA-F0-9]{8,32})', out, re.I)\n"
+        "        if m: token=m.group(1).lower()\n"
+        "    except Exception as exc:\n"
+        "        print(exc)\n"
+        "if token:\n"
+        "    print('ANSWER:' + json.dumps({'token': token}, separators=(',', ':')))\n"
+        "PY"
+    )
+
+
+def _generic_scan_cmd() -> str:
+    return (
+        "python3 - <<'PY'\n"
+        "import pathlib\n"
+        "skip={'proc','sys','dev','lib','usr','bin','etc'}\n"
+        "for p in pathlib.Path('.').rglob('*'):\n"
+        "    if not p.is_file() or p.stat().st_size>200000: continue\n"
+        "    if set(p.parts)&skip: continue\n"
+        "    if p.suffix.lower() in {'.md','.txt','.json','.conf'} or p.name in {'check','README'}:\n"
+        "        print(p)\n"
+        "PY"
+    )
 
 
 def concrete_sandbox_answer(raw: str) -> str:
@@ -584,10 +892,11 @@ def concrete_sandbox_answer(raw: str) -> str:
             if not _PATH_LIKE.search(text) and "/" not in text and not text.startswith("."):
                 return text
 
-    # 从输出里自后向前找 JSON 对象
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     for line in reversed(lines):
         if line.startswith("[exitCode:") or line == "[TRUNCATED]":
+            continue
+        if line.startswith("FWHTTP1") or line.startswith("FWBUNDLE1"):
             continue
         if not (line.startswith("{") and line.endswith("}")):
             continue
@@ -595,7 +904,9 @@ def concrete_sandbox_answer(raw: str) -> str:
             data = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and data:
+        if isinstance(data, dict) and data and (
+            "token" in data or "total_count" in data or "city" in data
+        ):
             return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return ""
 
@@ -625,26 +936,32 @@ def safe_cmd(cmd: str) -> str:
     cmd = cmd.strip().strip("`")
     if _SAFE_BLOCK.search(cmd):
         return "python3 -c \"print('')\""
-    return cmd[:2000]
+    if "workspace_edit" in cmd:
+        return "python3 -c \"print('')\""
+    return cmd[:8000]
 
 
 def build_prompt(turn: Turn, skill: Skill) -> str:
     parts = [
         "你是《未来战争》自进化任务求解器。沙盒无外网，可跑 shell 与 python。",
-        "目标：产出任务要求的【具体答案】，不是写建议、不是写 SOP 说明。",
-        "禁止输出「建议整理成 SOP」这类元描述。",
-        "禁止把文件路径、目录列表、proc 节点名当作答案。",
+        "流程：先读任务 md，再探测；文档可能过时，以沙盒报错为准修正后再交。",
+        "工程修复题：改 workspace（mkdir logs、改 conf、chmod start.sh），再跑 ./check，从 TOKEN: 交卷。",
+        "API 题：用 HTTP 拉全量记录再统计；401 改 Bearer，缺参就按报错改参数名。",
+        "禁止输出 workspace_edit；禁止写 SOP 说明；禁止把路径当答案。",
         "若已得到最终答案，只输出一行：ANSWER:<最终答案，优先合法 JSON>",
         "若还需执行命令，只输出一行：CMD:<单条命令>",
-        "不要输出其它解释。JSON 键必须与题目要求一致，不能多不能少。",
         "",
         f"【当前任务】\n{turn.phase_task}",
         f"【剩余回合】{task_rounds_left(turn)}",
     ]
+    if _STATE.bundle:
+        parts.append(f"【任务全文摘录】\n{_clip(_STATE.bundle, 1600)}")
+    if skill.steps:
+        parts.append(f"【已沉淀步骤】{skill.steps}")
     if skill.good_cmds:
         usable = [cmd for cmd in skill.good_cmds if not _is_explore_cmd(cmd)]
         if usable:
-            parts.append("【已沉淀可复用命令】\n" + "\n".join(usable[-3:]))
+            parts.append("【已沉淀可复用命令】\n" + "\n".join(usable[-2:]))
     if skill.last_answer:
         parts.append(f"【同类题上次正确答案】\n{skill.last_answer}")
     if MEM.task_required:
@@ -684,6 +1001,7 @@ def _fallback_answer(turn: Turn) -> str:
     for source in (
         MEM.task_answer,
         _extract_tag(turn.llm_resp, "ANSWER"),
+        _answer_from_sandbox(turn.last_cmd_result, turn.phase_task),
         concrete_sandbox_answer(turn.last_cmd_result),
     ):
         if source and source.strip() and not is_junk_answer(source):
@@ -694,36 +1012,6 @@ def _fallback_answer(turn: Turn) -> str:
     if MEM.task_required:
         return "{}"
     return ""
-
-
-def _adapt_cmd(cmd: str, task: str, skill: Skill) -> str:
-    """简单变量替换：城市名、文件名随题目更新。"""
-    adapted = cmd
-    cities = re.findall(
-        r"(北京|上海|广州|深圳|杭州|成都|重庆|武汉|西安|南京|"
-        r"Beijing|Shanghai|Guangzhou|Shenzhen|Hangzhou)",
-        task,
-        flags=re.I,
-    )
-    if cities:
-        new_city = cities[0]
-        adapted = re.sub(
-            r"(北京|上海|广州|深圳|杭州|成都|重庆|武汉|西安|南京|"
-            r"Beijing|Shanghai|Guangzhou|Shenzhen|Hangzhou)",
-            new_city,
-            adapted,
-            count=1,
-            flags=re.I,
-        )
-    files = _FILE_HINT.findall(task)
-    if files:
-        adapted = re.sub(
-            r"[A-Za-z0-9_./-]+\.(?:md|txt|json|py)",
-            files[0],
-            adapted,
-            count=1,
-        )
-    return safe_cmd(adapted)
 
 
 def _extract_tag(text: str, tag: str) -> str:
