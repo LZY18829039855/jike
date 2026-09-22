@@ -10,6 +10,34 @@ LOGGER = logging.getLogger(__name__)
 DECIDE_LOCK = threading.Lock()
 
 
+def _clip(text: str, limit: int = 1200) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + "\n...<truncated>...\n" + text[-20:]
+
+
+def _log_task_debug(payload: dict[str, Any], decision: dict[str, Any]) -> None:
+    """把自进化相关上下文打进 stdout，便于从我方日志反查 check 报错。"""
+    round_no = payload.get("roundNo")
+    phase = (payload.get("phaseTask") or "").strip()
+    last = (payload.get("lastCmdResult") or "").strip()
+    execute = (decision.get("executeCmd") or "").strip()
+    prompt = (decision.get("prompt") or "").strip()
+    if not (phase or last or execute or prompt):
+        return
+    if phase:
+        tip = phase.replace("\n", " ")
+        LOGGER.info("round %s task %s", round_no, tip[:160])
+    if last:
+        # 工程题重点：CHECK# / FIX# / TOKEN / FAIL
+        LOGGER.info("round %s sandbox %s", round_no, _clip(last, 1500))
+    if execute:
+        LOGGER.info("round %s exec %s", round_no, _clip(execute, 500))
+    if prompt:
+        LOGGER.info("round %s prompt_len=%s", round_no, len(prompt))
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
@@ -32,6 +60,10 @@ class Handler(BaseHTTPRequestHandler):
                 payload.get("roundNo"),
                 decision.get("roleCommandMap"),
             )
+            try:
+                _log_task_debug(payload, decision)
+            except Exception:
+                LOGGER.exception("task debug log failed")
             body = json.dumps(decision, ensure_ascii=False).encode("utf-8")
         except Exception:
             LOGGER.exception("decision failed")
