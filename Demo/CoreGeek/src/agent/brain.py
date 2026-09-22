@@ -43,6 +43,7 @@ from .protocol import (
     BOMB,
     BOSS_SUMMON,
     COPPER,
+    DAY_ROUNDS,
     DIZZY,
     IRON,
     LARGE_SUMMON,
@@ -82,6 +83,10 @@ STONE_RESERVE = 12
 STONE_BATCH = 10
 MINE_BATCH = 8
 WEAPON_UPGRADE_RESERVE = 100
+# 夜里前段最多 2 人控炮；近敌后再拉满 3
+NIGHT_EARLY_ROUNDS = 20
+NIGHT_EARLY_GUNNERS = 2
+NIGHT_THREAT_DIST = 12
 SUMMON_ORDERS = (BOSS_SUMMON, LARGE_SUMMON, MIDDLE_SUMMON, SMALL_SUMMON)
 ROBOT_ATTACK = {
     "smallRobot": 5,
@@ -161,17 +166,20 @@ def _day(
             commands,
             budget,
         )
-        if (
-            role.unit_id not in commands
-            and not is_idle_hold(role.unit_id)
-            and not _holding_line(turn, role)
-        ):
-            _idle_work(turn, role, claimed, commands)
+        if role.unit_id not in commands:
+            # 入夜前贴塔：只贴身采，不走开；其余空档全力采矿
+            _fill_idle_mine(
+                turn,
+                role,
+                claimed,
+                commands,
+                adjacent_only=_holding_line(turn, role),
+            )
     return prompt, execute_cmd
 
 
 def _holding_line(turn: Turn, role: Unit) -> bool:
-    """入夜前已经站到塔边的角色不要再被支使去采矿。"""
+    """入夜前已经站到塔边的角色不要再被支使走开去采矿。"""
     if not turn.near_night:
         return False
     return any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons())
@@ -455,7 +463,7 @@ def _pioneer_day(
     ):
         return prompt, ""
 
-    # 刷任务：有就绪就接；白天冷却贴点原地待命（绝不走开买东西/控炮）
+    # 刷任务：有就绪就接；白天冷却贴点时只贴身采，不走开错过任务
     if should_prioritize(turn):
         held = _accept_or_approach(
             turn, role, claimed, commands, hold_idle=True,
@@ -463,6 +471,9 @@ def _pioneer_day(
         if role.unit_id in commands:
             return prompt, ""
         if held:
+            _fill_idle_mine(
+                turn, role, claimed, commands, adjacent_only=True,
+            )
             return prompt, ""
 
     # 非紧急备祭品：人不在任务点附近
@@ -480,6 +491,19 @@ def _pioneer_day(
         _man_tower(turn, role, claimed, commands, prefer_inside=True)
     elif towers_missing and not _near_task_point(turn, role):
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
+
+    # 白天空档：开拓者也采矿（任务/宝藏/控炮都轮空时）
+    if role.unit_id not in commands:
+        at_tower = any(
+            distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
+        )
+        _fill_idle_mine(
+            turn,
+            role,
+            claimed,
+            commands,
+            adjacent_only=turn.near_night and at_tower,
+        )
     return prompt, ""
 
 
@@ -565,18 +589,42 @@ def _leave_task(
     return False
 
 
-def _idle_work(
+def _fill_idle_mine(
     turn: Turn,
     role: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
-) -> None:
-    if turn.near_night and _man_tower(turn, role, claimed, commands):
-        return
-    if _mine_economy(turn, role, claimed, commands, keep_stone=False):
-        return
-    if turn.weapons():
-        _man_tower(turn, role, claimed, commands)
+    *,
+    adjacent_only: bool = False,
+    stay_near: Pos | None = None,
+    max_dist: int = 12,
+) -> bool:
+    """无指令空档填采矿/卖货，避免整回合发呆。"""
+    if role.unit_id in commands:
+        return False
+    if adjacent_only or is_idle_hold(role.unit_id):
+        if role.backpack_full:
+            shop = turn.shop_pos()
+            if shop is not None and distance(role.pos, shop) <= 1:
+                return _sell_or_walk(turn, role, claimed, commands)
+            return False
+        for kind in mine_rank(turn, keep_stone=False):
+            mine = _adjacent_mine(turn, role, kind)
+            if mine is None or mine in claimed:
+                continue
+            commands[role.unit_id] = collect_command(mine)
+            claimed.add(mine)
+            return True
+        return False
+    return _mine_economy(
+        turn,
+        role,
+        claimed,
+        commands,
+        keep_stone=False,
+        stay_near=stay_near,
+        max_dist=max_dist,
+    )
 
 
 def _stay_on_task(
@@ -800,6 +848,33 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             commands[pick.unit_id] = attack_command(role.unit_id, *targets)
             fired.add(pick.unit_id)
             used_controllers.add(role.unit_id)
+
+    # 夜里炮冷却/无目标/未分到塔：空闲角色就近采矿，别干站
+    station = turn.station()
+    anchor = station.pos if station is not None else None
+    hostiles = bool(turn.hostile_robots())
+    gunners = {role.unit_id for role, _ in pairs}
+    for role in turn.controllable():
+        if role.unit_id in commands:
+            continue
+        at_tower = any(
+            distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
+        )
+        # 有敌且本回合分到炮/已贴塔：只贴身采，不离防
+        hold_post = hostiles and (at_tower or role.unit_id in gunners)
+        if hold_post:
+            _fill_idle_mine(
+                turn, role, claimed, commands, adjacent_only=True,
+            )
+        else:
+            _fill_idle_mine(
+                turn,
+                role,
+                claimed,
+                commands,
+                stay_near=anchor,
+                max_dist=10 if turn.weapons() else 99,
+            )
     return prompt, execute_cmd
 
 
@@ -1428,6 +1503,9 @@ def _mine_economy(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
     keep_stone: bool,
+    *,
+    stay_near: Pos | None = None,
+    max_dist: int = 99,
 ) -> bool:
     if role.backpack_full:
         MEM.mine_quota.pop(role.unit_id, None)
@@ -1440,7 +1518,10 @@ def _mine_economy(
         if have >= target:
             MEM.mine_quota.pop(role.unit_id, None)
             return _sell_or_walk(turn, role, claimed, commands)
-        if _mine_kind(turn, role, kind, claimed, commands):
+        if _mine_kind(
+            turn, role, kind, claimed, commands,
+            stay_near=stay_near, max_dist=max_dist,
+        ):
             return True
         # 采不到了：有货就去卖，清空计划
         if have >= 3:
@@ -1452,11 +1533,17 @@ def _mine_economy(
     for kind in ranked:
         if kind in {COPPER, IRON}:
             MEM.mine_quota[role.unit_id] = (kind, MINE_BATCH)
-            if _mine_kind(turn, role, kind, claimed, commands):
+            if _mine_kind(
+                turn, role, kind, claimed, commands,
+                stay_near=stay_near, max_dist=max_dist,
+            ):
                 return True
             MEM.mine_quota.pop(role.unit_id, None)
             continue
-        if _mine_kind(turn, role, kind, claimed, commands):
+        if _mine_kind(
+            turn, role, kind, claimed, commands,
+            stay_near=stay_near, max_dist=max_dist,
+        ):
             return True
     return False
 
@@ -1478,11 +1565,18 @@ def _mine_kind(
     kind: str,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    *,
+    stay_near: Pos | None = None,
+    max_dist: int = 99,
 ) -> bool:
     if role.backpack_full:
         return False
     mines = sorted(
-        (pos for pos in turn.mines(kind) if pos not in claimed),
+        (
+            pos for pos in turn.mines(kind)
+            if pos not in claimed
+            and (stay_near is None or distance(pos, stay_near) <= max_dist)
+        ),
         key=lambda pos: (distance(role.pos, pos), pos.x, pos.y),
     )
     for mine in mines:

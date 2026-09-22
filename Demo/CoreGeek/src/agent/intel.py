@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +16,8 @@ from .protocol import (
     WALL_MATERIAL,
     distance,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 LLM_DAILY_LIMIT = 3
 DEFAULT_ORE_PRICE = {WALL_MATERIAL: 1, IRON: 3, COPPER: 5}
@@ -181,6 +184,7 @@ def observe(turn: Turn) -> None:
         if len(MEM.folk) > 14:
             del MEM.folk[:-14]
         _merge_treasure(turn, parse_folk(turn, folk))
+        _log_folk_news(turn, folk)
 
     news = turn.official_news.strip()
     if news and news != MEM.last_official:
@@ -190,6 +194,7 @@ def observe(turn: Turn) -> None:
         if event is not None:
             MEM.events = [item for item in MEM.events if item.ore != event.ore]
             MEM.events.append(event)
+        _log_official_news(turn, news, event)
 
     _observe_task(turn)
     _observe_moves(turn)
@@ -200,6 +205,7 @@ def observe(turn: Turn) -> None:
 
     if turn.last_summon_result:
         MEM.treasure.last_result = turn.last_summon_result
+        _log_summon_result(turn)
         if turn.last_summon_result in {1, 4}:
             MEM.treasure.done = True
         elif turn.last_summon_result in {2, 3}:
@@ -720,6 +726,110 @@ def missing_ritual(turn: Turn, role) -> list[str]:
             continue
         need.append(name)
     return need
+
+
+_SUMMON_RESULT_HINT = {
+    1: "成功获取宝藏",
+    2: "地点无宝藏或时间未到",
+    3: "祭品错误",
+    4: "宝藏已空",
+}
+
+
+def _log_official_news(turn: Turn, text: str, event: MarketEvent | None) -> None:
+    """推理类：官方消息影响矿价/停采，原文明细落盘便于策略复盘。"""
+    prices = " ".join(
+        f"{name}={turn.vendor_prices.get(name, '?')}"
+        for name in (WALL_MATERIAL, IRON, COPPER)
+    )
+    LOGGER.info(
+        "round %s day %s 【官方消息/推理类】%s",
+        turn.round_no,
+        turn.day_no,
+        text,
+    )
+    if event is None:
+        LOGGER.info(
+            "round %s day %s 【官方消息解析】未识别出矿种波动 | 当前小贩价 %s",
+            turn.round_no,
+            turn.day_no,
+            prices,
+        )
+        return
+    kind_cn = "短缺涨价" if event.kind == "shortage" else "过剩降价"
+    LOGGER.info(
+        "round %s day %s 【官方消息解析】矿种=%s 类型=%s(%s) 生效日=%s~%s | 当前小贩价 %s | 活跃事件=%s",
+        turn.round_no,
+        turn.day_no,
+        event.ore,
+        event.kind,
+        kind_cn,
+        event.start_day,
+        event.end_day,
+        prices,
+        _format_events(),
+    )
+
+
+def _log_folk_news(turn: Turn, text: str) -> None:
+    """长上下文类：民间传闻累积后用于祭坛寻宝。"""
+    guess = MEM.treasure
+    pos = guess.pos.dump() if guess.pos else None
+    LOGGER.info(
+        "round %s day %s 【民间传闻/长上下文】第%s条 %s",
+        turn.round_no,
+        turn.day_no,
+        len(MEM.folk),
+        text,
+    )
+    LOGGER.info(
+        "round %s day %s 【宝藏推断】pos=%s items=%s day=%s phase=%s region=%s weak=%s done=%s | 累计传闻=%s条",
+        turn.round_no,
+        turn.day_no,
+        pos,
+        guess.items,
+        guess.day,
+        guess.phase,
+        guess.region or "-",
+        guess.weak,
+        guess.done,
+        len(MEM.folk),
+    )
+    if len(MEM.folk) >= 2:
+        LOGGER.info(
+            "round %s day %s 【民间传闻汇总】\n%s",
+            turn.round_no,
+            turn.day_no,
+            "\n".join(f"  [{idx}] {item}" for idx, item in enumerate(MEM.folk, 1)),
+        )
+
+
+def _log_summon_result(turn: Turn) -> None:
+    code = turn.last_summon_result
+    hint = _SUMMON_RESULT_HINT.get(code, f"未知码{code}")
+    guess = MEM.treasure
+    pos = guess.pos.dump() if guess.pos else None
+    LOGGER.info(
+        "round %s day %s 【召唤宝藏结果】code=%s (%s) | 当前推断 pos=%s items=%s day=%s phase=%s",
+        turn.round_no,
+        turn.day_no,
+        code,
+        hint,
+        pos,
+        guess.items,
+        guess.day,
+        guess.phase,
+    )
+
+
+def _format_events() -> str:
+    if not MEM.events:
+        return "无"
+    parts = [
+        f"{ev.ore}:{ev.kind}@D{ev.start_day}-D{ev.end_day}"
+        for ev in MEM.events
+    ]
+    return "; ".join(parts)
 
 
 def parse_official(turn: Turn, text: str) -> MarketEvent | None:
