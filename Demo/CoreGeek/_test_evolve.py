@@ -227,7 +227,7 @@ cmd3 = out.get("executeCmd") or ""
 assert out["roleCommandMap"].get("10011", {}).get("action") != "submitAnswer", out
 assert "logs" in cmd3 or "EDIT_DONE" in cmd3 or "mkdir" in cmd3 or out.get("prompt"), out
 
-# 冷却贴点：已在任务点旁且无 phaseTask 时不应来回 move
+# 冷却贴点：已在任务点旁且无 phaseTask 时不应来回 move / 不应去买祭品
 reset_memory()
 reset()
 payload["phaseTask"] = ""
@@ -238,16 +238,18 @@ for role in payload["teamOur"]["roles"]:
     if role.get("roleType") == "pioneer":
         role["pos"] = {"x": 14, "y": 14}
         break
-# 若地图有任务点在附近，连续两回合不应对打振荡
 out1 = decide(payload)
 out2 = decide(payload)
 c1 = (out1["roleCommandMap"].get("10011") or {})
 c2 = (out2["roleCommandMap"].get("10011") or {})
+# 两回合都 move 且目标互相翻转则失败
 if c1.get("action") == "move" and c2.get("action") == "move":
     p1 = (c1["targetPos"][0]["x"], c1["targetPos"][0]["y"])
     p2 = (c2["targetPos"][0]["x"], c2["targetPos"][0]["y"])
-    # 允许同向连续接近，禁止 A→B→A 式翻格（此处两回合目标互为对方出发点的近似）
-    assert p1 != (14, 14) or p2 != (14, 14) or p1 == p2, (c1, c2)
+    assert not (p1 != p2 and abs(p1[0] - p2[0]) + abs(p1[1] - p2[1]) <= 2 and
+                abs(p1[0] - 14) + abs(p1[1] - 14) <= 2), (c1, c2)
+# 贴点待命时不应 buy
+assert c1.get("action") != "buy" and c2.get("action") != "buy", (c1, c2)
 
 # 在任务点上不得走向另一个任务点
 reset_memory()

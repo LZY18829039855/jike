@@ -417,16 +417,17 @@ def _pioneer_day(
     if _hunt_treasure(turn, role, claimed, commands):
         return prompt, ""
 
-    # 宝藏将开但缺祭品：先去买齐
+    # 宝藏将开但缺祭品：仅在不贴任务点、或已贴商店时去买，避免拉开抖腿
     if (
         turn.weapons()
         and not turn.near_night
         and treasure_imminent(turn)
+        and _ritual_buy_ok(turn, role)
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
     ):
         return prompt, ""
 
-    # 刷任务：有就绪就接；白天冷却贴点待命；勿与炮塔来回抖
+    # 刷任务：有就绪就接；白天冷却贴点原地待命（绝不走开买东西/控炮）
     if should_prioritize(turn):
         held = _accept_or_approach(
             turn, role, claimed, commands, hold_idle=True,
@@ -434,18 +435,9 @@ def _pioneer_day(
         if role.unit_id in commands:
             return prompt, ""
         if held:
-            # 白天贴点空档：顺手买祭品，否则原地待命
-            if (
-                turn.weapons()
-                and not turn.near_night
-                and _buy_ritual_or_walk(
-                    turn, role, claimed, commands, turn.gold,
-                ) is not None
-            ):
-                return prompt, ""
             return prompt, ""
 
-    # 非紧急时也可慢慢备齐祭品（人不在任务点附近时）
+    # 非紧急备祭品：人不在任务点附近
     if (
         turn.weapons()
         and not turn.near_night
@@ -455,7 +447,7 @@ def _pioneer_day(
     ):
         return prompt, ""
 
-    # 近夜或不在任务点：才去控炮；贴点冷却时绝不走向炮塔
+    # 近夜或不在任务点：才去控炮
     if turn.weapons() and (turn.near_night or not _near_task_point(turn, role)):
         _man_tower(turn, role, claimed, commands, prefer_inside=True)
     elif towers_missing and not _near_task_point(turn, role):
@@ -463,10 +455,22 @@ def _pioneer_day(
     return prompt, ""
 
 
+def _ritual_buy_ok(turn: Turn, role: Unit) -> bool:
+    """贴任务点冷却时不离开；已贴商店则可买。"""
+    if not _near_task_point(turn, role):
+        return True
+    shop = turn.shop_pos()
+    return shop is not None and distance(role.pos, shop) <= 1
+
+
 def _near_task_point(turn: Turn, role: Unit) -> bool:
     points = list(turn.our_task_points()) or [
         item.pos for item in turn.tasks if item.valid
     ]
+    if MEM.task_pos is not None:
+        points = list(points) + [MEM.task_pos]
+    if MEM.pending_task_pos is not None:
+        points = list(points) + [MEM.pending_task_pos]
     return any(distance(role.pos, pos) <= 1 for pos in points)
 
 
@@ -497,9 +501,10 @@ def _accept_or_approach(
     points = list(turn.our_task_points()) or [item.pos for item in turn.tasks if item.valid]
     if not points:
         return False
+    # 已贴任意任务点：原地待命，不发 move
     if any(distance(role.pos, pos) <= 1 for pos in points):
-        # 已贴点：原地待命，不发 move
         return True
+    # 选一个固定最近点（按坐标打破平局），避免两点间来回翻
     nearest = min(points, key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
     step = _step_toward(turn, role, nearest, claimed)
     if step is not None:
@@ -577,13 +582,8 @@ def _glue_to_task(
     if anchor is None:
         return False
     dist = distance(role.pos, anchor)
-    if dist == 0:
-        return False
-    if dist == 1:
-        if turn.land(anchor) and anchor not in claimed:
-            commands[role.unit_id] = move_command(anchor)
-            claimed.add(anchor)
-            return True
+    # 0/1 格都合法：原地待命，不要为了踩中心格来回挪
+    if dist <= 1:
         return False
     step = _step_toward(turn, role, anchor, claimed)
     if step is not None:
