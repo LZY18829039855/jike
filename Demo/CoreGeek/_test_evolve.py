@@ -198,7 +198,7 @@ cmd = out["roleCommandMap"].get("10011") or {}
 assert "0de1b57493cf" in cmd.get("taskAnswer", ""), cmd
 assert "fc1e78eb2a5a" not in cmd.get("taskAnswer", ""), cmd
 
-# 工程题 edit → verify 分步，失败可再 edit
+# 工程题：自摸索 explore（check→fix→verify），失败可再探
 reset_memory()
 reset()
 payload["phaseTask"] = "请阅读task_1_alpha.md，获取任务信息"
@@ -213,19 +213,25 @@ payload["lastCmdResult"] = (
 )
 out = decide(payload)
 cmd1 = out.get("executeCmd") or ""
-assert "EDIT_DONE" in cmd1 or "mkdir" in cmd1 or "logs" in cmd1, out
-payload["lastCmdResult"] = "[exitCode:0]\nws ... app alpha\nEDIT_DONE /tmp/ws_1"
-out = decide(payload)
-cmd2 = out.get("executeCmd") or ""
-assert "check" in cmd2.lower() or "TOKEN" in cmd2 or "ANSWER" in cmd2, out
+assert "PROBE" in cmd1 or "CHECK#" in cmd1 or "run_check" in cmd1 or "apply_fix" in cmd1, out
+# 探索失败（无 TOKEN）后应允许再探或问 LLM，不得交旧 TOKEN
 payload["lastCmdResult"] = (
-    "[exitCode:0]\n[FAIL] port mismatch expected 8080\n"
+    "[exitCode:0]\nPROBE task=... ws=... app=alpha\n"
+    "CHECK#0 [FAIL] port mismatch expected 8080\nFIX#0 ['mkdir ...']\n"
+    "CHECK#1 [FAIL] still bad\nNO_FIX\n"
 )
 out = decide(payload)
-# 失败后应再 edit，而不是交旧 TOKEN / 空等
-cmd3 = out.get("executeCmd") or ""
 assert out["roleCommandMap"].get("10011", {}).get("action") != "submitAnswer", out
-assert "logs" in cmd3 or "EDIT_DONE" in cmd3 or "mkdir" in cmd3 or out.get("prompt"), out
+cmd2 = out.get("executeCmd") or ""
+assert "PROBE" in cmd2 or "CHECK#" in cmd2 or out.get("prompt"), out
+# 探索成功应直接交卷
+payload["lastCmdResult"] = (
+    "[exitCode:0]\nCHECK#0 [ OK ] 全部通过 (6/6) | TOKEN: a1b2c3d4e5f6 |\n"
+    'ANSWER:{"token":"a1b2c3d4e5f6"}'
+)
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert "a1b2c3d4e5f6" in cmd.get("taskAnswer", ""), cmd
 
 # 冷却贴点：已在任务点旁且无 phaseTask 时不应来回 move / 不应去买祭品
 reset_memory()
