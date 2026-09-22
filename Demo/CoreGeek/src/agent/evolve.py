@@ -113,6 +113,8 @@ class EvolveState:
     ws_dir: str = ""
     http_done: bool = False
     ws_done: bool = False
+    ws_tries: int = 0
+    ws_phase: str = ""  # "" | edit | verify | failed
     boot_done: bool = False
     fingerprint: str = ""
     drop_sandbox: bool = False
@@ -150,6 +152,8 @@ def reset() -> None:
     _STATE.ws_dir = ""
     _STATE.http_done = False
     _STATE.ws_done = False
+    _STATE.ws_tries = 0
+    _STATE.ws_phase = ""
     _STATE.boot_done = False
     _STATE.fingerprint = ""
     _STATE.drop_sandbox = False
@@ -197,6 +201,8 @@ def on_task_text(task: str) -> None:
     _STATE.ws_dir = ""
     _STATE.http_done = False
     _STATE.ws_done = False
+    _STATE.ws_tries = 0
+    _STATE.ws_phase = ""
     _STATE.boot_done = False
     _STATE.fingerprint = fingerprint
     _STATE.drop_sandbox = bool(prev)
@@ -361,6 +367,15 @@ def solve(
         MEM.awaiting_task = False
         return "", probe
 
+    # 5.5) 工程题 edit/verify 已发出、等沙盒：别抢着问 LLM
+    if (
+        (_STATE.kind or _classify(task)) == "engineering-fix"
+        and not _STATE.ws_done
+        and _STATE.ws_phase in {"edit", "verify"}
+        and not force_submit_now(turn)
+    ):
+        return "", ""
+
     # 6) 快超时保底：只用沙盒证据，不用写死城市库
     if force_submit_now(turn):
         payload = patch_task_answer(_fallback_answer(turn), turn)
@@ -402,9 +417,18 @@ def next_probe_cmd(task: str, skill: Skill) -> str | None:
         city = _STATE.city or _detect_city(_STATE.bundle or task) or "北京"
         return _http_probe_cmd(city)
 
+    # 工程题：edit → verify，失败可重试（敌方同款），最多 3 轮
     if kind == "engineering-fix" and not _STATE.ws_done:
-        _STATE.ws_done = True
-        return _workspace_fix_cmd(task)
+        if _STATE.ws_tries >= 3 and _STATE.ws_phase == "failed":
+            return None
+        if _STATE.ws_phase in {"", "failed"}:
+            _STATE.ws_tries += 1
+            _STATE.ws_phase = "edit"
+            return _workspace_edit_cmd(task)
+        if _STATE.ws_phase == "edit_done":
+            _STATE.ws_phase = "verify"
+            return _workspace_verify_cmd(task)
+        return None
 
     # 未知题型：读点名文件 / 目录
     files = _FILE_HINT.findall(task)
@@ -654,6 +678,19 @@ def _ingest_sandbox(raw: str, task: str, skill: Skill) -> None:
 
     if re.search(r"\[\s*OK\s*\]|全部通过", raw, re.I) and _extract_token(raw):
         skill.steps = "WORKSPACE_EDIT>VERIFY"
+        _STATE.ws_done = True
+        _STATE.ws_phase = "done"
+    elif (_STATE.kind or _classify(task) or _classify(_STATE.bundle)) == "engineering-fix":
+        # edit 跑完后一律进 verify；verify 失败则允许下一轮 edit
+        if _STATE.ws_phase == "edit":
+            _STATE.ws_phase = "edit_done"
+        elif _STATE.ws_phase == "verify":
+            if not re.search(r"\[\s*OK\s*\]|全部通过", raw, re.I):
+                _STATE.ws_phase = "failed"
+                _STATE.ws_done = False
+        elif re.search(r"NEED_WORKSPACE|未通过|FAIL|AssertionError|Error", raw, re.I):
+            _STATE.ws_phase = "failed"
+            _STATE.ws_done = False
 
 
 def _answer_from_sandbox(raw: str, task: str) -> str:
@@ -927,13 +964,104 @@ def _http_probe_cmd(city: str) -> str:
     )
 
 
-def _workspace_fix_cmd(task: str) -> str:
+def _workspace_edit_cmd(task: str) -> str:
+    """按题干/上次报错修 workspace：建 logs、改 conf、chmod start.sh。"""
+    filename = _STATE.task_file or _task_filename(task) or "task.md"
+    app = _STATE.app_name or "app"
+    hint_path = _STATE.task_path
+    err_hint = _clip(_STATE.last_sandbox, 800) if _STATE.last_sandbox else ""
+    return (
+        "python3 - <<'PY'\n"
+        "import os, pathlib, re, stat\n"
+        f"FN = {filename!r}\n"
+        f"APP = {app!r}\n"
+        f"HINT = {hint_path!r}\n"
+        f"ERR = {err_hint!r}\n"
+        "skip={'lib','boot','run','sbin','var','sys','bin','etc','dev','usr','lib64','proc'}\n"
+        "task=pathlib.Path(HINT) if HINT else None\n"
+        "if task is None or not task.is_file():\n"
+        "    for p in pathlib.Path('.').rglob(FN):\n"
+        "        if p.is_file() and not (set(p.parts)&skip):\n"
+        "            task=p; break\n"
+        "text = task.read_text(encoding='utf-8', errors='ignore') if task and task.is_file() else ''\n"
+        "blob = text + '\\n' + ERR\n"
+        "app = APP\n"
+        "m = re.search(r'alpha|beta|gamma|delta|omega', (text+' '+str(task or FN)+' '+ERR).lower())\n"
+        "if m: app = m.group(0)\n"
+        "ws=None\n"
+        "if task:\n"
+        "    base=task.parent\n"
+        "    m=re.search(r'ws_\\d+', text+' '+str(task)+' '+ERR)\n"
+        "    names=[]\n"
+        "    if m: names.append(m.group(0))\n"
+        "    names += ['ws_1','ws_2','ws_3', app]\n"
+        "    for name in names:\n"
+        "        cand=base/name\n"
+        "        if cand.is_dir():\n"
+        "            ws=cand; break\n"
+        "        hit=next((p for p in base.rglob(name) if p.is_dir()), None)\n"
+        "        if hit:\n"
+        "            ws=hit; break\n"
+        "    if ws is None:\n"
+        "        for p in base.iterdir():\n"
+        "            if p.is_dir() and ((p/'check').exists() or (p/'check.py').exists()):\n"
+        "                ws=p; break\n"
+        "print('ws', ws, 'app', app)\n"
+        "if ws is None:\n"
+        "    print('NEED_WORKSPACE')\n"
+        "    raise SystemExit\n"
+        "logs=ws/'logs'/app\n"
+        "logs.mkdir(mode=0o755, parents=True, exist_ok=True)\n"
+        "os.chmod(logs, 0o755)\n"
+        "os.chmod(ws/'logs', 0o755) if (ws/'logs').is_dir() else None\n"
+        "spec=''\n"
+        "for name in ('spec.md','SPEC.md','README.md'):\n"
+        "    p=ws/name\n"
+        "    if p.is_file(): spec += p.read_text(encoding='utf-8', errors='ignore')+'\\n'\n"
+        "blob = text+'\\n'+spec+'\\n'+ERR\n"
+        "conf=None\n"
+        "cfgdir=ws/'config'\n"
+        "for cand in [cfgdir/(app+'.conf'), cfgdir/(app+'.cfg')]:\n"
+        "    if cand.is_file(): conf=cand; break\n"
+        "if conf is None and cfgdir.is_dir():\n"
+        "    files=list(cfgdir.glob('*.conf'))+list(cfgdir.glob('*.cfg'))\n"
+        "    conf=files[0] if files else None\n"
+        "if conf is not None:\n"
+        "    raw=conf.read_text(encoding='utf-8', errors='ignore')\n"
+        "    port=re.search(r'port\\s*[:=：]?\\s*(\\d+)', blob, re.I)\n"
+        "    svc=re.search(r'(?:service[_ ]?name|name)\\s*[:=：]?\\s*([A-Za-z0-9_-]+)', blob, re.I)\n"
+        "    # 报错里常见 expected X but got Y\n"
+        "    exp_port=re.search(r'port.*?(\\d{2,5}).*?(?:got|实际|now|=)\\s*(\\d{2,5})', ERR, re.I)\n"
+        "    if not port:\n"
+        "        port=re.search(r'(?:listen|bind).*?(\\d{2,5})', blob, re.I)\n"
+        "    out=[]\n"
+        "    for line in raw.splitlines():\n"
+        "        if re.match(r'\\s*port\\b', line, re.I) and (port or exp_port):\n"
+        "            val=(port.group(1) if port else exp_port.group(1))\n"
+        "            out.append(re.sub(r'\\d+', val, line, count=1))\n"
+        "        elif re.match(r'\\s*name\\b', line, re.I) and svc:\n"
+        "            out.append(re.sub(r'(name\\s*[:=]?\\s*)\\S+', r'\\g<1>'+svc.group(1), line, count=1, flags=re.I))\n"
+        "        else:\n"
+        "            out.append(line)\n"
+        "    conf.write_text('\\n'.join(out)+('\\n' if raw.endswith('\\n') else ''), encoding='utf-8')\n"
+        "    print('patched', conf)\n"
+        "start=ws/'bin'/'start.sh'\n"
+        "if start.is_file():\n"
+        "    os.chmod(start, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)\n"
+        "    print('chmod', start)\n"
+        "print('EDIT_DONE', ws)\n"
+        "PY"
+    )
+
+
+def _workspace_verify_cmd(task: str) -> str:
+    """跑 ./check，打印 TOKEN / 失败信息。"""
     filename = _STATE.task_file or _task_filename(task) or "task.md"
     app = _STATE.app_name or "app"
     hint_path = _STATE.task_path
     return (
         "python3 - <<'PY'\n"
-        "import json, os, pathlib, re, stat, subprocess, sys\n"
+        "import pathlib, re, subprocess, sys\n"
         f"FN = {filename!r}\n"
         f"APP = {app!r}\n"
         f"HINT = {hint_path!r}\n"
@@ -965,41 +1093,10 @@ def _workspace_fix_cmd(task: str) -> str:
         "        for p in base.iterdir():\n"
         "            if p.is_dir() and ((p/'check').exists() or (p/'check.py').exists()):\n"
         "                ws=p; break\n"
-        "print('ws', ws, 'app', app)\n"
+        "print('ws', ws)\n"
         "if ws is None:\n"
         "    print('NEED_WORKSPACE')\n"
         "    raise SystemExit\n"
-        "logs=ws/'logs'/app\n"
-        "logs.mkdir(mode=0o755, parents=True, exist_ok=True)\n"
-        "os.chmod(logs, 0o755)\n"
-        "spec=''\n"
-        "for name in ('spec.md','SPEC.md','README.md'):\n"
-        "    p=ws/name\n"
-        "    if p.is_file(): spec += p.read_text(encoding='utf-8', errors='ignore')+'\\n'\n"
-        "blob=text+'\\n'+spec\n"
-        "conf=None\n"
-        "cfgdir=ws/'config'\n"
-        "for cand in [cfgdir/ (app+'.conf'), cfgdir/(app+'.cfg')]:\n"
-        "    if cand.is_file(): conf=cand; break\n"
-        "if conf is None and cfgdir.is_dir():\n"
-        "    files=list(cfgdir.glob('*.conf'))+list(cfgdir.glob('*.cfg'))\n"
-        "    conf=files[0] if files else None\n"
-        "if conf is not None:\n"
-        "    raw=conf.read_text(encoding='utf-8', errors='ignore')\n"
-        "    port=re.search(r'port\\s+(\\d+)', blob, re.I)\n"
-        "    svc=re.search(r'name\\s+([A-Za-z0-9_-]+)', blob, re.I)\n"
-        "    out=[]\n"
-        "    for line in raw.splitlines():\n"
-        "        if port and re.match(r'\\s*port\\b', line, re.I):\n"
-        "            out.append(re.sub(r'\\d+', port.group(1), line, count=1))\n"
-        "        elif svc and re.match(r'\\s*name\\b', line, re.I):\n"
-        "            out.append(re.sub(r'(name\\s+)\\S+', r'\\1'+svc.group(1), line, count=1, flags=re.I))\n"
-        "        else:\n"
-        "            out.append(line)\n"
-        "    conf.write_text('\\n'.join(out)+('\\n' if raw.endswith('\\n') else ''), encoding='utf-8')\n"
-        "start=ws/'bin'/'start.sh'\n"
-        "if start.is_file():\n"
-        "    os.chmod(start, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)\n"
         "check=ws/'check.py' if (ws/'check.py').exists() else ws/'check'\n"
         "token=''\n"
         "if check.exists():\n"
@@ -1011,19 +1108,22 @@ def _workspace_fix_cmd(task: str) -> str:
         "    try:\n"
         "        proc=subprocess.run(cmd, cwd=str(ws), capture_output=True, text=True, timeout=20)\n"
         "        out=(proc.stdout or '')+'\\n'+(proc.stderr or '')\n"
-        "        print(out)\n"
+        "        print(out[:2000])\n"
         "        m=re.search(r'TOKEN\\s*[:：]\\s*([a-fA-F0-9]{12,32})', out, re.I)\n"
         "        if m: token=m.group(1).lower()\n"
-        "        if '[ OK ]' in out or '全部通过' in out:\n"
-        "            print(out)\n"
-        "        else:\n"
-        "            print(out[:1500])\n"
         "    except Exception as exc:\n"
         "        print(exc)\n"
+        "else:\n"
+        "    print('NEED_CHECK')\n"
         "if token and len(token)>=12 and token not in {'xxx','yyy','zzz'}:\n"
-        "    print('ANSWER:' + json.dumps({'token': token}, separators=(',', ':')))\n"
+        "    print('ANSWER:' + __import__('json').dumps({'token': token}, separators=(',', ':')))\n"
         "PY"
     )
+
+
+def _workspace_fix_cmd(task: str) -> str:
+    """兼容旧入口：一轮 edit（随后由探测队列跑 verify）。"""
+    return _workspace_edit_cmd(task)
 
 
 def _generic_scan_cmd() -> str:

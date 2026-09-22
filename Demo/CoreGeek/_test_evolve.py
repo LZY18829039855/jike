@@ -198,6 +198,57 @@ cmd = out["roleCommandMap"].get("10011") or {}
 assert "0de1b57493cf" in cmd.get("taskAnswer", ""), cmd
 assert "fc1e78eb2a5a" not in cmd.get("taskAnswer", ""), cmd
 
+# 工程题 edit → verify 分步，失败可再 edit
+reset_memory()
+reset()
+payload["phaseTask"] = "请阅读task_1_alpha.md，获取任务信息"
+payload["llmResp"] = ""
+payload["lastCmdResult"] = ""
+out = decide(payload)
+assert "FWBUNDLE1" in (out.get("executeCmd") or ""), out
+payload["lastCmdResult"] = (
+    '[exitCode:0] | FWBUNDLE1 {"ok":true,'
+    '"task_path":"./tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md",'
+    '"task":"# 修复应用 alpha\\nworkspace ws_1/\\nport 8080\\nname alpha-svc"} |'
+)
+out = decide(payload)
+cmd1 = out.get("executeCmd") or ""
+assert "EDIT_DONE" in cmd1 or "mkdir" in cmd1 or "logs" in cmd1, out
+payload["lastCmdResult"] = "[exitCode:0]\nws ... app alpha\nEDIT_DONE /tmp/ws_1"
+out = decide(payload)
+cmd2 = out.get("executeCmd") or ""
+assert "check" in cmd2.lower() or "TOKEN" in cmd2 or "ANSWER" in cmd2, out
+payload["lastCmdResult"] = (
+    "[exitCode:0]\n[FAIL] port mismatch expected 8080\n"
+)
+out = decide(payload)
+# 失败后应再 edit，而不是交旧 TOKEN / 空等
+cmd3 = out.get("executeCmd") or ""
+assert out["roleCommandMap"].get("10011", {}).get("action") != "submitAnswer", out
+assert "logs" in cmd3 or "EDIT_DONE" in cmd3 or "mkdir" in cmd3 or out.get("prompt"), out
+
+# 冷却贴点：已在任务点旁且无 phaseTask 时不应来回 move
+reset_memory()
+reset()
+payload["phaseTask"] = ""
+payload["lastCmdResult"] = ""
+payload["llmResp"] = ""
+payload["roundNo"] = 40
+for role in payload["teamOur"]["roles"]:
+    if role.get("roleType") == "pioneer":
+        role["pos"] = {"x": 14, "y": 14}
+        break
+# 若地图有任务点在附近，连续两回合不应对打振荡
+out1 = decide(payload)
+out2 = decide(payload)
+c1 = (out1["roleCommandMap"].get("10011") or {})
+c2 = (out2["roleCommandMap"].get("10011") or {})
+if c1.get("action") == "move" and c2.get("action") == "move":
+    p1 = (c1["targetPos"][0]["x"], c1["targetPos"][0]["y"])
+    p2 = (c2["targetPos"][0]["x"], c2["targetPos"][0]["y"])
+    # 允许同向连续接近，禁止 A→B→A 式翻格（此处两回合目标互为对方出发点的近似）
+    assert p1 != (14, 14) or p2 != (14, 14) or p1 == p2, (c1, c2)
+
 # 在任务点上不得走向另一个任务点
 reset_memory()
 reset()

@@ -426,25 +426,48 @@ def _pioneer_day(
     ):
         return prompt, ""
 
-    # 否则刷任务点换金币/积分（冷却期也持续 accept，敌方同款）
+    # 刷任务：有就绪就接；白天冷却贴点待命；勿与炮塔来回抖
     if should_prioritize(turn):
-        if _accept_or_approach(turn, role, claimed, commands):
+        held = _accept_or_approach(
+            turn, role, claimed, commands, hold_idle=True,
+        )
+        if role.unit_id in commands:
+            return prompt, ""
+        if held:
+            # 白天贴点空档：顺手买祭品，否则原地待命
+            if (
+                turn.weapons()
+                and not turn.near_night
+                and _buy_ritual_or_walk(
+                    turn, role, claimed, commands, turn.gold,
+                ) is not None
+            ):
+                return prompt, ""
             return prompt, ""
 
-    # 非紧急时也可慢慢备齐祭品
+    # 非紧急时也可慢慢备齐祭品（人不在任务点附近时）
     if (
         turn.weapons()
         and not turn.near_night
         and not treasure_imminent(turn)
+        and not _near_task_point(turn, role)
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
     ):
         return prompt, ""
 
-    if turn.weapons():
+    # 近夜或不在任务点：才去控炮；贴点冷却时绝不走向炮塔
+    if turn.weapons() and (turn.near_night or not _near_task_point(turn, role)):
         _man_tower(turn, role, claimed, commands, prefer_inside=True)
-    elif towers_missing:
+    elif towers_missing and not _near_task_point(turn, role):
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
     return prompt, ""
+
+
+def _near_task_point(turn: Turn, role: Unit) -> bool:
+    points = list(turn.our_task_points()) or [
+        item.pos for item in turn.tasks if item.valid
+    ]
+    return any(distance(role.pos, pos) <= 1 for pos in points)
 
 
 def _accept_or_approach(
@@ -452,8 +475,10 @@ def _accept_or_approach(
     role: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    *,
+    hold_idle: bool = True,
 ) -> bool:
-    """有就绪任务才接；冷却中走近任务点等待，不空刷 accept。"""
+    """有就绪任务才接；冷却中白天贴点待命，夜里不空走任务点。"""
     task = pick_task(turn, role)
     if task is not None:
         if distance(role.pos, task.pos) <= 1:
@@ -466,12 +491,16 @@ def _accept_or_approach(
             return True
         return False
 
+    if not hold_idle:
+        return False
+
     points = list(turn.our_task_points()) or [item.pos for item in turn.tasks if item.valid]
     if not points:
         return False
-    nearest = min(points, key=lambda pos: distance(role.pos, pos))
-    if distance(role.pos, nearest) <= 1:
-        return False
+    if any(distance(role.pos, pos) <= 1 for pos in points):
+        # 已贴点：原地待命，不发 move
+        return True
+    nearest = min(points, key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
     step = _step_toward(turn, role, nearest, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
@@ -673,7 +702,10 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
         if _hunt_treasure(turn, pioneer, claimed, commands):
             used_controllers.add(pioneer.unit_id)
     elif pioneer is not None and should_prioritize(turn):
-        if _accept_or_approach(turn, pioneer, claimed, commands):
+        # 夜里：有就绪任务才接/走近；无任务不当贴点抖腿，留给下面当炮手
+        if _accept_or_approach(
+            turn, pioneer, claimed, commands, hold_idle=False,
+        ):
             used_controllers.add(pioneer.unit_id)
     else:
         prompt = _maybe_treasure_prompt(turn)
