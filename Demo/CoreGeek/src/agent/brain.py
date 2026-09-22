@@ -16,12 +16,17 @@ from .intel import (
     can_prompt,
     dump_ore,
     failed_cells,
+    hold_idle,
     hold_ore,
+    is_idle_hold,
     mark_prompt,
     mine_rank,
     missing_ritual,
+    note_purchase,
     note_summon_used,
     observe,
+    oscillation_bans,
+    purchase_busy,
     remember_commands,
     remember_task_accept,
     should_abandon_task,
@@ -75,6 +80,8 @@ from .protocol import (
 TOWER_LOADOUT = ("rocket", "rocket", "rocket")
 STONE_RESERVE = 12
 STONE_BATCH = 10
+MINE_BATCH = 8
+WEAPON_UPGRADE_RESERVE = 100
 SUMMON_ORDERS = (BOSS_SUMMON, LARGE_SUMMON, MIDDLE_SUMMON, SMALL_SUMMON)
 ROBOT_ATTACK = {
     "smallRobot": 5,
@@ -99,6 +106,7 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
         prompt, execute_cmd = _day(turn, commands)
     else:
         prompt, execute_cmd = _night(turn, commands)
+    _dedupe_role_commands(turn, commands)
     remember_commands(commands)
     return {
         "roleCommandMap": {
@@ -153,7 +161,11 @@ def _day(
             commands,
             budget,
         )
-        if role.unit_id not in commands and not _holding_line(turn, role):
+        if (
+            role.unit_id not in commands
+            and not is_idle_hold(role.unit_id)
+            and not _holding_line(turn, role)
+        ):
             _idle_work(turn, role, claimed, commands)
     return prompt, execute_cmd
 
@@ -226,25 +238,30 @@ def _worker_day(
                     return budget - WEAPON_BUILD_COST
                 return budget
 
-    # 5.5) 三座塔齐了就去买武器升级，不要等墙砌完
-    if len(turn.weapons()) >= 3 and _prefer_weapon_upgrade(turn, role, budget):
-        spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
-        if spent is not None:
-            return budget - spent
+    # 5.5) 三炮齐后优先升到二级，不为侧墙分散启动资金
+    fire_ready = _firepower_ready(turn)
+    if len(turn.weapons()) >= 3 and not fire_ready:
+        if _prefer_weapon_upgrade(turn, role, budget):
+            spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
+            if spent is not None:
+                return budget - spent
+        # 升级未完成：只砌迎敌面，上下侧暂缓
+        front = _front_wall_cells(turn)
+        walls_missing = [pos for pos in walls_missing if pos in front]
 
-    # 6) 先砌来敌面全长 + 上下各一半，再去做别的
+    # 6) 砌墙（火力未成形时列表已收成迎敌面）
     if walls_missing and _wall_work(
         turn, role, walls_missing, claimed, commands,
     ):
         return budget
 
-    # 6.5) 墙未齐但已有塔、金币够，也去买券（一人一张）
-    if _prefer_weapon_upgrade(turn, role, budget):
+    # 6.5) 火力已达标后再追更高等级券
+    if fire_ready and _prefer_weapon_upgrade(turn, role, budget):
         spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
         if spent is not None:
             return budget - spent
 
-    # 7) 有铜/铁/涨价矿就尽快卖掉换成金币
+    # 7) 有铜/铁/涨价矿就尽快卖掉换成金币（采满批次再卖）
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
         return budget
 
@@ -259,8 +276,19 @@ def _worker_day(
     return budget
 
 
+def _firepower_ready(turn: Turn) -> bool:
+    """三门火箭均达到二级，才算核心火力成形。"""
+    weapons = turn.weapons()
+    return len(weapons) >= 3 and all(tower.level >= 2 for tower in weapons)
+
+
+def _front_wall_cells(turn: Turn) -> set[Pos]:
+    front, _top, _bottom = _wall_build_plan(turn)
+    return set(front)
+
+
 def _prefer_weapon_upgrade(turn: Turn, role: Unit, budget: int) -> bool:
-    """核心墙已齐、有塔且金币够时，去买武器升级券。"""
+    """有塔且金币够时，去买武器升级券。"""
     weapons = turn.weapons()
     if not weapons:
         return False
@@ -659,15 +687,22 @@ def _buy_named_or_walk(
     shop = turn.shop_pos()
     if shop is None:
         return False
+    if purchase_busy(name, role.unit_id, turn.round_no):
+        return False
     price = turn.shop_price(name)
     if budget < price:
         return False
     if distance(role.pos, shop) <= 1:
         commands[role.unit_id] = buy_command(name, 1)
+        note_purchase(name, role.unit_id, turn.round_no)
         return True
     step = _step_toward(turn, role, shop, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        note_purchase(name, role.unit_id, turn.round_no)
+        return True
+    if oscillation_bans(role.unit_id):
+        hold_idle(role.unit_id)
         return True
     return False
 
@@ -1109,10 +1144,14 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
         return False
     if role.backpack_full:
         return True
-    # 只把铜/铁当卖金钱；石头默认留着建墙
+    # 采卖计划未完成：先采满批次再卖
+    plan = MEM.mine_quota.get(role.unit_id)
+    if plan is not None:
+        kind, target = plan
+        if role.item_count(kind) < target and not role.backpack_full:
+            return False
     copper = ores.get(COPPER, 0)
     iron = ores.get(IRON, 0)
-    # 敌方同款：铜铁积到就整包大额卖，阈值尽量低
     if copper > 0 or iron > 0:
         value = copper * turn.ore_price(COPPER) + iron * turn.ore_price(IRON)
         if dump_ore(turn, COPPER) or dump_ore(turn, IRON):
@@ -1206,12 +1245,19 @@ def _buy_or_walk(
     if want is None:
         return None
     name, price = want
+    if purchase_busy(name, role.unit_id, turn.round_no):
+        return None
     if distance(role.pos, shop) <= 1:
         commands[role.unit_id] = buy_command(name, 1)
+        note_purchase(name, role.unit_id, turn.round_no)
         return price
     step = _step_toward(turn, role, shop, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        note_purchase(name, role.unit_id, turn.round_no)
+        return 0
+    if oscillation_bans(role.unit_id):
+        hold_idle(role.unit_id)
         return 0
     return None
 
@@ -1223,20 +1269,27 @@ def _wanted_purchase(
     weapons = turn.weapons()
     walls = turn.walls()
     station = turn.station()
+    # 三炮未升满二级时预留升级金，避免被墙券/炸弹花光
+    reserve = 0
+    if len(weapons) >= 3 and not _firepower_ready(turn):
+        reserve = min(WEAPON_UPGRADE_RESERVE, turn.shop_price(WEAPON_UPGRADE_1))
 
-    def can_buy(name: str, stack: int = 1) -> tuple[str, int] | None:
+    def can_buy(name: str, stack: int = 1, *, core: bool = False) -> tuple[str, int] | None:
+        if purchase_busy(name, role.unit_id, turn.round_no):
+            return None
         price = turn.shop_price(name)
-        if budget >= price and role.item_count(name) < stack:
+        pool = budget if core else budget - reserve
+        if pool >= price and role.item_count(name) < stack:
             return name, price
         return None
 
     # 1) 有塔则火力升级最优先（每座 L1→L2 / L2→L3）
     if any(tower.level == 1 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_1)
+        item = can_buy(WEAPON_UPGRADE_1, core=True)
         if item:
             return item
     if any(tower.level == 2 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_2)
+        item = can_buy(WEAPON_UPGRADE_2, core=True)
         if item:
             return item
     # 2) 基地保命升到 L2/L3
@@ -1248,15 +1301,16 @@ def _wanted_purchase(
         item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
-    # 3) 再升级围墙
-    if any(wall.level == 1 for wall in walls):
-        item = can_buy(WALL_UPGRADE_1)
-        if item:
-            return item
-    if any(wall.level == 2 for wall in walls):
-        item = can_buy(WALL_UPGRADE_2)
-        if item:
-            return item
+    # 3) 火力成形后再升级围墙
+    if _firepower_ready(turn) or len(weapons) < 3:
+        if any(wall.level == 1 for wall in walls):
+            item = can_buy(WALL_UPGRADE_1)
+            if item:
+                return item
+        if any(wall.level == 2 for wall in walls):
+            item = can_buy(WALL_UPGRADE_2)
+            if item:
+                return item
     # 4) 残墙先补血，比重建便宜（阈值放宽，尽早买 WallFixer）
     if any(wall.health * 5 < _wall_max_hp(wall) * 4 for wall in walls):
         item = can_buy(WALL_FIXER, stack=2)
@@ -1279,11 +1333,11 @@ def _wanted_purchase(
             if item:
                 return item
     # 5) 炸弹 100 金在 3x3 内打 100 点，可以囤
-    if turn.day_no >= 3:
+    if turn.day_no >= 3 and _firepower_ready(turn):
         item = can_buy(BOMB, stack=2)
         if item:
             return item
-    if turn.day_no >= 3:
+    if turn.day_no >= 3 and _firepower_ready(turn):
         item = can_buy(DIZZY, stack=1)
         if item:
             return item
@@ -1376,10 +1430,32 @@ def _mine_economy(
     keep_stone: bool,
 ) -> bool:
     if role.backpack_full:
+        MEM.mine_quota.pop(role.unit_id, None)
         return _sell_or_walk(turn, role, claimed, commands)
+
+    plan = MEM.mine_quota.get(role.unit_id)
+    if plan is not None:
+        kind, target = plan
+        have = role.item_count(kind)
+        if have >= target:
+            MEM.mine_quota.pop(role.unit_id, None)
+            return _sell_or_walk(turn, role, claimed, commands)
+        if _mine_kind(turn, role, kind, claimed, commands):
+            return True
+        # 采不到了：有货就去卖，清空计划
+        if have >= 3:
+            MEM.mine_quota.pop(role.unit_id, None)
+            return _sell_or_walk(turn, role, claimed, commands)
+        MEM.mine_quota.pop(role.unit_id, None)
 
     ranked = mine_rank(turn, keep_stone)
     for kind in ranked:
+        if kind in {COPPER, IRON}:
+            MEM.mine_quota[role.unit_id] = (kind, MINE_BATCH)
+            if _mine_kind(turn, role, kind, claimed, commands):
+                return True
+            MEM.mine_quota.pop(role.unit_id, None)
+            continue
         if _mine_kind(turn, role, kind, claimed, commands):
             return True
     return False
@@ -1419,6 +1495,10 @@ def _mine_kind(
         if step is not None:
             commands[role.unit_id] = move_command(step)
             return True
+        # 堵路/防抖：本回合待命，别换矿点来回抖
+        if oscillation_bans(role.unit_id):
+            hold_idle(role.unit_id)
+            return True
     return False
 
 
@@ -1440,6 +1520,9 @@ def _build_or_walk(
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        return True
+    if oscillation_bans(role.unit_id):
+        hold_idle(role.unit_id)
         return True
     return False
 
@@ -1464,7 +1547,7 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
-    avoid = set(failed_cells(role.unit_id)) | claimed
+    avoid = set(failed_cells(role.unit_id)) | set(oscillation_bans(role.unit_id)) | claimed
     for stand in _stand_cells(turn, role, target, claimed, inside_only):
         if stand == role.pos:
             return None
@@ -1481,7 +1564,89 @@ def _step_toward(
     if step is not None and step not in avoid:
         claimed.add(step)
         return step
+    # 防抖把两极都禁了：尝试仅禁失败格再走一步，仍不行则待命
+    soft = set(failed_cells(role.unit_id)) | claimed
+    step = next_step(turn, role, target, soft)
+    if step is not None and step not in soft and step not in oscillation_bans(role.unit_id):
+        claimed.add(step)
+        return step
     return None
+
+
+def _command_goal_key(command: dict[str, Any]) -> tuple[Any, ...] | None:
+    """(动作, 目的地/物品) —— 用于全局去重，避免两角色做同一件事。"""
+    action = command.get("action")
+    if not action:
+        return None
+    # 交卷/接任务/开宝藏不参与去重
+    if action in {"submitAnswer", "acceptTask", "summonTreasure", "attack"}:
+        return None
+    targets = command.get("targetPos") or ()
+    name = command.get("name") or ""
+    if action in {"move", "build", "collect", "remove"} and targets:
+        raw = targets[0]
+        return (action, int(raw["x"]), int(raw["y"]), name)
+    if action == "use" and targets:
+        raw = targets[0]
+        return (action, name, int(raw["x"]), int(raw["y"]))
+    if action == "use":
+        return (action, name)
+    if action in {"buy", "sell"}:
+        return (action, name, int(command.get("num") or 1))
+    return (action, name)
+
+
+def _unit_by_id(turn: Turn, unit_id: int) -> Unit | None:
+    for role in turn.controllable():
+        if role.unit_id == unit_id:
+            return role
+    return None
+
+
+def _dedupe_role_commands(
+    turn: Turn, commands: dict[int, dict[str, Any]],
+) -> None:
+    """同一目的动作+目的地只留一个角色；优先保留离目标更近者。"""
+    buckets: dict[tuple[Any, ...], list[int]] = {}
+    for unit_id, command in commands.items():
+        key = _command_goal_key(command)
+        if key is None:
+            continue
+        buckets.setdefault(key, []).append(unit_id)
+    for key, unit_ids in buckets.items():
+        if len(unit_ids) < 2:
+            continue
+        action = key[0]
+        if action in {"move", "build", "collect", "remove"} and len(key) >= 3:
+            try:
+                goal = Pos(int(key[1]), int(key[2]))
+            except (TypeError, ValueError):
+                goal = None
+            if goal is not None:
+                def _dist(uid: int, g: Pos = goal) -> int:
+                    unit = _unit_by_id(turn, uid)
+                    return distance(unit.pos, g) if unit else 10**9
+
+                unit_ids.sort(key=_dist)
+            else:
+                unit_ids.sort()
+        elif action == "use" and len(key) >= 4:
+            try:
+                goal = Pos(int(key[2]), int(key[3]))
+            except (TypeError, ValueError):
+                goal = None
+            if goal is not None:
+                def _dist_use(uid: int, g: Pos = goal) -> int:
+                    unit = _unit_by_id(turn, uid)
+                    return distance(unit.pos, g) if unit else 10**9
+
+                unit_ids.sort(key=_dist_use)
+            else:
+                unit_ids.sort()
+        else:
+            unit_ids.sort()
+        for uid in unit_ids[1:]:
+            commands.pop(uid, None)
 
 
 def _stand_cells(
@@ -1580,11 +1745,42 @@ def _half_toward_front(cells: list[Pos], northwest: bool) -> list[Pos]:
     return ordered[:half]
 
 
+def _side_trim_count(turn: Turn) -> int:
+    """按全局战况缩短上下侧：早中期/低压多缩 2 格，受压少缩 1 格。"""
+    robots = len(turn.hostile_robots())
+    weapons = turn.weapons()
+    l2 = sum(1 for tower in weapons if tower.level >= 2)
+    if robots >= 6 or (turn.near_night and robots >= 3):
+        return 1
+    if len(weapons) < 3 or l2 < 2:
+        return 2
+    if turn.round_no < 100 and robots <= 2:
+        return 2
+    return 1
+
+
+def _trim_side_walls(cells: list[Pos], northwest: bool, trim: int) -> list[Pos]:
+    """从远离敌一侧再削掉 trim 格，至少保留 1 格。"""
+    if not cells:
+        return []
+    if trim <= 0:
+        return list(cells)
+    ordered = sorted(cells, key=lambda pos: (pos.x, pos.y))
+    keep = max(1, len(ordered) - trim)
+    if northwest:
+        # 半墙靠右；削左端（远端）
+        return ordered[-keep:]
+    return ordered[:keep]
+
+
 def _wall_build_plan(turn: Turn) -> tuple[list[Pos], list[Pos], list[Pos]]:
-    """实际要砌的格子：来敌面全长 + 上下各一半（靠来敌侧）。"""
+    """实际要砌的格子：来敌面全长 + 上下半墙（再按战况缩短 1～2 格）。"""
     front, top, bottom, _rear = _wall_face_cells(turn)
     nw = _base_is_northwest(turn)
-    return front, _half_toward_front(top, nw), _half_toward_front(bottom, nw)
+    trim = _side_trim_count(turn)
+    top_h = _trim_side_walls(_half_toward_front(top, nw), nw, trim)
+    bottom_h = _trim_side_walls(_half_toward_front(bottom, nw), nw, trim)
+    return front, top_h, bottom_h
 
 
 def _wall_ring(turn: Turn) -> tuple[Pos, ...]:

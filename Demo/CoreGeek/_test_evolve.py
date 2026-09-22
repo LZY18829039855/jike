@@ -291,4 +291,32 @@ worker_cmds = {
 }
 assert worker_cmds, out
 
+# 全局去重：两角色同动作同目的地只留一个
+from agent.brain import _command_goal_key, _dedupe_role_commands
+from agent.intel import MEM, oscillation_bans
+from agent.protocol import Pos, Turn
+
+reset_memory()
+payload["phaseTask"] = ""
+payload["roundNo"] = 50
+# 构造最小 Turn 去重
+cmds = {
+    10010: {"action": "collect", "targetPos": [{"x": 33, "y": 14}]},
+    10012: {"action": "collect", "targetPos": [{"x": 33, "y": 14}]},
+    10011: {"action": "move", "targetPos": [{"x": 27, "y": 7}]},
+}
+turn = Turn.load(payload)
+_dedupe_role_commands(turn, cmds)
+assert len([u for u, c in cmds.items() if c.get("action") == "collect"]) == 1, cmds
+assert _command_goal_key(cmds[10011]) == ("move", 27, 7, "")
+
+# 防抖：A-B-A 应禁止回到 A
+reset_memory()
+MEM.move_hist[10011] = [Pos(27, 7), Pos(27, 6)]
+bans = oscillation_bans(10011)
+assert Pos(27, 7) in bans
+MEM.move_hist[10011] = [Pos(27, 7), Pos(27, 6), Pos(27, 7), Pos(27, 6)]
+bans = oscillation_bans(10011)
+assert Pos(27, 7) in bans and Pos(27, 6) in bans
+
 print("evolve integration ok")

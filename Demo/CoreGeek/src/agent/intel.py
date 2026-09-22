@@ -90,6 +90,14 @@ class Memory:
     skip_task_until: int = 0
     last_move: dict[int, Pos] = field(default_factory=dict)
     last_build: dict[int, Pos] = field(default_factory=dict)
+    # 最近几步 move 目标，用于检测 A-B-A 卡位抖动
+    move_hist: dict[int, list[Pos]] = field(default_factory=dict)
+    # 采购在途：item -> (buyer_id, round)
+    pending_buy: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # 采卖计划：unit -> (矿种, 目标数量)
+    mine_quota: dict[int, tuple[str, int]] = field(default_factory=dict)
+    # 本回合堵路待命，禁止再被 idle 支使去抖
+    idle_hold: set[int] = field(default_factory=set)
     failed_steps: dict[int, set[Pos]] = field(default_factory=dict)
     bad_build: set[Pos] = field(default_factory=set)
     build_failures: dict[Pos, int] = field(default_factory=dict)
@@ -122,6 +130,10 @@ def reset_memory() -> None:
     MEM.skip_task_until = 0
     MEM.last_move.clear()
     MEM.last_build.clear()
+    MEM.move_hist.clear()
+    MEM.pending_buy.clear()
+    MEM.mine_quota.clear()
+    MEM.idle_hold.clear()
     MEM.failed_steps.clear()
     MEM.bad_build.clear()
     MEM.build_failures.clear()
@@ -148,6 +160,8 @@ def reset_memory() -> None:
 
 def observe(turn: Turn) -> None:
     _ensure_match(turn)
+    MEM.idle_hold.clear()
+    _clear_stale_purchases(turn)
 
     if MEM.llm_day != turn.day_no:
         MEM.llm_day = turn.day_no
@@ -271,6 +285,7 @@ def _observe_moves(turn: Turn) -> None:
 def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
     MEM.last_move.clear()
     MEM.last_build.clear()
+    active_movers = set()
     for unit_id, command in commands.items():
         action = command.get("action")
         if action not in {"move", "build"}:
@@ -282,8 +297,71 @@ def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
         pos = Pos(int(raw["x"]), int(raw["y"]))
         if action == "move":
             MEM.last_move[unit_id] = pos
+            active_movers.add(unit_id)
+            hist = MEM.move_hist.setdefault(unit_id, [])
+            hist.append(pos)
+            if len(hist) > 6:
+                del hist[:-6]
         else:
             MEM.last_build[unit_id] = pos
+    # 本回合未移动的角色清空抖动史，避免隔回合误伤
+    for unit_id in list(MEM.move_hist):
+        if unit_id not in active_movers:
+            MEM.move_hist.pop(unit_id, None)
+
+
+def oscillation_bans(unit_id: int) -> frozenset[Pos]:
+    """若近期在 A↔B 来回迈，禁止再迈回上一格（打断 A-B-A）。"""
+    hist = MEM.move_hist.get(unit_id) or []
+    bans: set[Pos] = set()
+    if len(hist) >= 2 and hist[-1] != hist[-2]:
+        bans.add(hist[-2])
+    # 已确认连抖：两极都暂时禁掉，逼寻路换第三方向或原地待命
+    if (
+        len(hist) >= 4
+        and hist[-1] == hist[-3]
+        and hist[-2] == hist[-4]
+        and hist[-1] != hist[-2]
+    ):
+        bans.add(hist[-1])
+        bans.add(hist[-2])
+    return frozenset(bans)
+
+
+def _clear_stale_purchases(turn: Turn) -> None:
+    """持有物品或超时则释放采购锁。"""
+    by_id = {unit.unit_id: unit for unit in turn.controllable()}
+    for name, (buyer, started) in list(MEM.pending_buy.items()):
+        unit = by_id.get(buyer)
+        if unit is not None and unit.has_item(name):
+            MEM.pending_buy.pop(name, None)
+            continue
+        if turn.round_no - started > 5:
+            MEM.pending_buy.pop(name, None)
+
+
+def purchase_busy(name: str, unit_id: int, round_no: int) -> bool:
+    """其它角色已在买同款商品。"""
+    entry = MEM.pending_buy.get(name)
+    if entry is None:
+        return False
+    buyer, started = entry
+    if round_no - started > 5:
+        MEM.pending_buy.pop(name, None)
+        return False
+    return buyer != unit_id
+
+
+def note_purchase(name: str, unit_id: int, round_no: int) -> None:
+    MEM.pending_buy[name] = (unit_id, round_no)
+
+
+def hold_idle(unit_id: int) -> None:
+    MEM.idle_hold.add(unit_id)
+
+
+def is_idle_hold(unit_id: int) -> bool:
+    return unit_id in MEM.idle_hold
 
 
 def failed_cells(unit_id: int) -> frozenset[Pos]:
