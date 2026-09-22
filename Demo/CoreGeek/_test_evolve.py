@@ -208,8 +208,8 @@ out = decide(payload)
 assert "FWBUNDLE1" in (out.get("executeCmd") or ""), out
 payload["lastCmdResult"] = (
     '[exitCode:0] | FWBUNDLE1 {"ok":true,'
-    '"task_path":"./tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md",'
-    '"task":"# 修复应用 alpha\\nworkspace ws_1/\\nport 8080\\nname alpha-svc"} |'
+    '"task_path":"tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md",'
+    '"task":"# 修复应用 alpha\\nworkspace ws_1/\\nport 8080\\nname alpha-app"} |'
 )
 out = decide(payload)
 cmd1 = out.get("executeCmd") or ""
