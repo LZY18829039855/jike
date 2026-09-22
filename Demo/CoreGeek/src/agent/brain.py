@@ -183,7 +183,7 @@ def _worker_day(
             return budget
 
     # 2) 手里已有升级券优先用掉（尤其是武器升级券）
-    if _try_use_upgrade(turn, role, commands):
+    if _try_use_upgrade(turn, role, commands, claimed):
         return budget
 
     # 2.5) 手里的召唤令立刻用掉，作用于对手下个夜晚
@@ -226,13 +226,19 @@ def _worker_day(
                     return budget - WEAPON_BUILD_COST
                 return budget
 
+    # 5.5) 三座塔齐了就去买武器升级，不要等墙砌完
+    if len(turn.weapons()) >= 3 and _prefer_weapon_upgrade(turn, role, budget):
+        spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
+        if spent is not None:
+            return budget - spent
+
     # 6) 先砌来敌面全长 + 上下各一半，再去做别的
     if walls_missing and _wall_work(
         turn, role, walls_missing, claimed, commands,
     ):
         return budget
 
-    # 6.5) 核心墙完成后，再升级武器
+    # 6.5) 墙未齐但已有塔、金币够，也去买券（一人一张）
     if _prefer_weapon_upgrade(turn, role, budget):
         spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
         if spent is not None:
@@ -686,6 +692,9 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     for role, _ in pairs:
         if role.unit_id in commands:
             continue
+        if _try_use_upgrade(turn, role, commands, claimed):
+            used_controllers.add(role.unit_id)
+            continue
         if role.health <= 100:
             med = role.find_item(MEDICINE)
             if med:
@@ -954,9 +963,13 @@ def _rocket_targets(
 
 
 def _try_use_upgrade(
-    turn: Turn, role: Unit, commands: dict[int, dict[str, Any]],
+    turn: Turn,
+    role: Unit,
+    commands: dict[int, dict[str, Any]],
+    claimed: set[Pos] | None = None,
 ) -> bool:
-    # 武器升级
+    claimed = claimed if claimed is not None else set()
+    # 武器升级：两人分头去不同的塔，寻路互斥
     for voucher, need_level in (
         (WEAPON_UPGRADE_1, 1),
         (WEAPON_UPGRADE_2, 2),
@@ -964,18 +977,17 @@ def _try_use_upgrade(
         item = role.find_item(voucher)
         if not item:
             continue
-        for tower in turn.weapons():
-            if tower.level == need_level and distance(role.pos, tower.pos) <= 1:
-                commands[role.unit_id] = use_command(item, tower.pos)
-                return True
-        # 走向待升级塔
-        targets = [tower for tower in turn.weapons() if tower.level == need_level]
-        if targets:
-            target = min(targets, key=lambda unit: distance(role.pos, unit.pos))
-            step = _step_toward(turn, role, target.pos, set())
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
-                return True
+        tower = _pick_upgrade_tower(turn, role, need_level, claimed)
+        if tower is None:
+            continue
+        claimed.add(tower.pos)
+        if distance(role.pos, tower.pos) <= 1:
+            commands[role.unit_id] = use_command(item, tower.pos)
+            return True
+        step = _step_toward(turn, role, tower.pos, claimed)
+        if step is not None:
+            commands[role.unit_id] = move_command(step)
+            return True
 
     station = turn.station()
     if station is not None:
@@ -989,7 +1001,7 @@ def _try_use_upgrade(
             if _footprint_distance(role.pos, station_footprint(station.pos)) <= 1:
                 commands[role.unit_id] = use_command(item, station.pos)
                 return True
-            step = _step_toward(turn, role, station.pos, set(), inside_only=True)
+            step = _step_toward(turn, role, station.pos, claimed, inside_only=True)
             if step is not None:
                 commands[role.unit_id] = move_command(step)
                 return True
@@ -1025,11 +1037,33 @@ def _try_use_upgrade(
         targets = [wall for wall in turn.walls() if wall.level == need_level]
         if targets:
             target = min(targets, key=lambda unit: distance(role.pos, unit.pos))
-            step = _step_toward(turn, role, target.pos, set())
+            step = _step_toward(turn, role, target.pos, claimed)
             if step is not None:
+                claimed.add(target.pos)
                 commands[role.unit_id] = move_command(step)
                 return True
     return False
+
+
+def _pick_upgrade_tower(
+    turn: Turn, role: Unit, need_level: int, claimed: set[Pos],
+):
+    towers = [tower for tower in turn.weapons() if tower.level == need_level]
+    if not towers:
+        return None
+    adjacent = [
+        tower for tower in towers
+        if distance(role.pos, tower.pos) <= 1 and tower.pos not in claimed
+    ]
+    if adjacent:
+        return min(adjacent, key=lambda unit: (unit.pos.x, unit.pos.y))
+    free = [tower for tower in towers if tower.pos not in claimed]
+    if not free:
+        return None
+    return min(
+        free,
+        key=lambda unit: (distance(role.pos, unit.pos), unit.pos.x, unit.pos.y),
+    )
 
 
 def _wall_max_hp(wall: Unit) -> int:
@@ -1283,11 +1317,16 @@ def _man_tower(
         for tower in towers:
             if distance(other.pos, tower.pos) <= 1:
                 occupied_stands.add(tower.pos)
-    free = [tower for tower in towers if tower.pos not in occupied_stands]
-    pool = free or list(towers)
-    tower = min(pool, key=lambda unit: distance(role.pos, unit.pos))
+    free = [
+        tower for tower in towers
+        if tower.pos not in occupied_stands and tower.pos not in claimed
+    ]
+    if not free:
+        return False
+    tower = min(free, key=lambda unit: (distance(role.pos, unit.pos), unit.pos.x, unit.pos.y))
     if distance(role.pos, tower.pos) <= 1:
         return False
+    claimed.add(tower.pos)
     step = _step_toward(
         turn, role, tower.pos, claimed, inside_only=prefer_inside,
     )
@@ -1343,6 +1382,7 @@ def _mine_kind(
             commands[role.unit_id] = collect_command(mine)
             claimed.add(mine)
             return True
+        claimed.add(mine)
         step = _step_toward(turn, role, mine, claimed)
         if step is not None:
             commands[role.unit_id] = move_command(step)
@@ -1364,6 +1404,7 @@ def _build_or_walk(
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
         return True
+    claimed.add(target)
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
@@ -1401,6 +1442,8 @@ def _step_toward(
         if step is None or step in avoid:
             continue
         claimed.add(step)
+        if stand != role.pos:
+            claimed.add(stand)
         return step
     step = next_step(turn, role, target, avoid)
     if step is not None and step not in avoid:

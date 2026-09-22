@@ -122,11 +122,15 @@ _SKILLS: dict[str, Skill] = {}
 _STATE = EvolveState()
 _HTTP_SOP = HttpSop()
 _LEARNED_CITIES: dict[str, dict[str, Any]] = {}
+_USED_TOKENS: set[str] = set()
+_TOKEN_OWNER: dict[str, str] = {}
 
 
 def reset() -> None:
     _SKILLS.clear()
     _LEARNED_CITIES.clear()
+    _USED_TOKENS.clear()
+    _TOKEN_OWNER.clear()
     _HTTP_SOP.auth = ""
     _HTTP_SOP.param = ""
     _HTTP_SOP.url = "http://localhost:8899/api/v1/heritage/search"
@@ -167,6 +171,17 @@ def on_task_text(task: str) -> None:
     if fingerprint == _STATE.fingerprint and family == _STATE.family:
         return
     prev = _STATE.fingerprint
+    prev_file = _STATE.task_file
+    if prev_file:
+        for skill in _SKILLS.values():
+            token = _token_of_payload(skill.last_answer)
+            if token and token not in _TOKEN_OWNER:
+                _TOKEN_OWNER[token] = prev_file
+                _USED_TOKENS.add(token)
+        mem_token = _token_of_payload(MEM.task_answer)
+        if mem_token and mem_token not in _TOKEN_OWNER:
+            _TOKEN_OWNER[mem_token] = prev_file
+            _USED_TOKENS.add(mem_token)
     _STATE.family = family
     _STATE.kind = _classify(task)
     _STATE.explore_i = 0
@@ -453,7 +468,17 @@ def _answer_fits_task(payload: str, task: str) -> bool:
             token = str(data.get("token") or "")
         elif _valid_token(blob):
             token = blob
-        return _valid_token(token)
+        if not _valid_token(token):
+            return False
+        key = token.lower()
+        owner = _TOKEN_OWNER.get(key, "")
+        current = (_STATE.task_file or "").lower()
+        # 本题可重交（走出范围失败）；别的工程题严禁复用
+        if owner and current and owner != current:
+            return False
+        if key in _USED_TOKENS and owner != current:
+            return False
+        return True
     if kind == "unknown-api":
         if not isinstance(data, dict):
             return False
@@ -1114,6 +1139,7 @@ def build_prompt(turn: Turn, skill: Skill) -> str:
         "API 题：用 HTTP 拉全量记录再统计；401 改 Bearer，缺参就按报错改参数名。",
         "禁止输出 workspace_edit；禁止写 SOP 说明；禁止把路径当答案。",
         "禁止提交 {\"token\":\"xxx\"} 或 md 里的示例 JSON；工程题必须 check 输出 [ OK ] 和 TOKEN: 后才交。",
+        "工程题禁止复用上一题 TOKEN，必须跑本题 ./check 拿到新 TOKEN。",
         "API 题必须分页拉全量（offset+=10 直到本页不足 10 条），禁止只交第一页。",
         "若已得到最终答案，只输出一行：ANSWER:<最终答案，优先合法 JSON>",
         "若还需执行命令，只输出一行：CMD:<单条命令>",
@@ -1129,8 +1155,10 @@ def build_prompt(turn: Turn, skill: Skill) -> str:
         usable = [cmd for cmd in skill.good_cmds if not _is_explore_cmd(cmd)]
         if usable:
             parts.append("【已沉淀可复用命令】\n" + "\n".join(usable[-2:]))
-    if skill.last_answer:
+    if skill.last_answer and _STATE.kind != "engineering-fix":
         parts.append(f"【同类题上次正确答案】\n{skill.last_answer}")
+    elif _STATE.kind == "engineering-fix":
+        parts.append("【注意】步骤可复用，但 TOKEN 必须来自本题 ./check，禁止交上一题的 token。")
     if MEM.task_required:
         parts.append("【必须包含的键】 " + ", ".join(MEM.task_required))
     if MEM.task_forbidden:
@@ -1142,7 +1170,11 @@ def build_prompt(turn: Turn, skill: Skill) -> str:
     elif skill.sandbox_notes:
         parts.append(f"【历史沙盒摘录】\n{_clip(skill.sandbox_notes, 1200)}")
     if MEM.task_answer:
-        parts.append(f"【上次提交】\n{MEM.task_answer}")
+        stale = _token_of_payload(MEM.task_answer)
+        owner = _TOKEN_OWNER.get(stale, "") if stale else ""
+        current = _STATE.task_file or ""
+        if not (stale and owner and owner != current):
+            parts.append(f"【上次提交】\n{MEM.task_answer}")
     rider = treasure_rider(turn)
     if rider:
         parts.append(rider)
@@ -1160,6 +1192,10 @@ def _commit_answer(
         return
     remember_answer(payload)
     skill.last_answer = payload
+    token = _token_of_payload(payload)
+    if token:
+        _USED_TOKENS.add(token)
+        _TOKEN_OWNER[token] = _STATE.task_file or ""
     commands[role.unit_id] = submit_answer_command(payload)
     MEM.awaiting_task = False
 
@@ -1174,12 +1210,28 @@ def _fallback_answer(turn: Turn) -> str:
     ):
         if source and source.strip() and not is_junk_answer(source) and _answer_fits_task(source, task):
             return source.strip()
-    skill = _SKILLS.get(_STATE.family)
-    if skill and skill.last_answer and not is_junk_answer(skill.last_answer) and _answer_fits_task(skill.last_answer, task):
-        return skill.last_answer
+    # 工程题绝不复用上一题 TOKEN；API 题城市对得上才复用
+    if (_STATE.kind or _classify(task)) != "engineering-fix":
+        skill = _SKILLS.get(_STATE.family)
+        if skill and skill.last_answer and not is_junk_answer(skill.last_answer) and _answer_fits_task(skill.last_answer, task):
+            return skill.last_answer
     if MEM.task_required:
         return "{}"
     return ""
+
+
+def _token_of_payload(payload: str) -> str:
+    blob = (payload or "").strip()
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        data = None
+    token = ""
+    if isinstance(data, dict):
+        token = str(data.get("token") or "")
+    elif _valid_token(blob):
+        token = blob
+    return token.lower() if _valid_token(token) else ""
 
 
 def _extract_tag(text: str, tag: str) -> str:

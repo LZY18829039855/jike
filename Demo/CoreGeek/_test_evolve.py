@@ -172,6 +172,32 @@ cmd = out["roleCommandMap"].get("10011") or {}
 assert cmd.get("action") != "submitAnswer", out
 assert "python3" in (out.get("executeCmd") or "") or out.get("prompt"), out
 
+# 工程题不得复用上一题 TOKEN
+reset_memory()
+reset()
+payload["phaseTask"] = "请阅读task_1_alpha.md，获取任务信息"
+payload["llmResp"] = ""
+payload["lastCmdResult"] = (
+    '[exitCode:0]\n[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a |'
+)
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert "fc1e78eb2a5a" in cmd.get("taskAnswer", ""), cmd
+payload["phaseTask"] = "请阅读task_2_beta.md，获取任务信息"
+payload["lastCmdResult"] = ""
+payload["llmResp"] = 'ANSWER:{"token":"fc1e78eb2a5a"}'
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert cmd.get("taskAnswer", "") != '{"token":"fc1e78eb2a5a"}', out
+payload["llmResp"] = ""
+payload["lastCmdResult"] = (
+    '[exitCode:0]\n[ OK ] 全部通过 (6/6) | TOKEN: 0de1b57493cf |'
+)
+out = decide(payload)
+cmd = out["roleCommandMap"].get("10011") or {}
+assert "0de1b57493cf" in cmd.get("taskAnswer", ""), cmd
+assert "fc1e78eb2a5a" not in cmd.get("taskAnswer", ""), cmd
+
 # 在任务点上不得走向另一个任务点
 reset_memory()
 reset()
