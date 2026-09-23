@@ -391,6 +391,13 @@ def _worker_day(
             commands[role.unit_id] = use_command(med)
             return budget
 
+    # Day3 先清空铜铁再做升级和采购；协议每回合只能卖一种矿，
+    # 所以会先卖涨价铁，下一回合继续卖铜。
+    if _day3_ores_left(turn, role) and _sell_or_walk(
+        turn, role, claimed, commands,
+    ):
+        return budget
+
     # 2) 手里已有升级券优先用掉（尤其是武器升级券）
     if _try_use_upgrade(turn, role, commands, claimed):
         return budget
@@ -476,7 +483,7 @@ def _worker_day(
     # Day1 墙已齐：改挖铁为主；升炮/购物仍可做
     day1_iron = turn.day_no <= 1 and not early_walls
 
-    # 第 2 天起：迎敌面和双炮边升二级，每天至少买 1 个修复包（排在武器券前）
+    # 核心火力阶段目标完成后，再买迎敌面墙券和修复包。
     spent = _buy_wall_supplies(turn, role, claimed, commands, budget)
     if spent is not None:
         return budget - spent
@@ -539,18 +546,38 @@ def _front_wall_cells(turn: Turn) -> set[Pos]:
 
 
 def _next_weapon_voucher(turn: Turn) -> str | None:
-    """下一张武器券。已有两座二级时先买三级券，不把第三座升成二级。"""
+    """按阶段目标选择下一张武器券：Day2 两座 L2，Day3 先出一座 L3。"""
     weapons = turn.weapons()
     if not weapons:
         return None
-    level2 = sum(1 for tower in weapons if tower.level == 2)
-    if level2 >= 2:
+    upgraded = sum(1 for tower in weapons if tower.level >= 2)
+    if upgraded < 2 and any(tower.level == 1 for tower in weapons):
+        return WEAPON_UPGRADE_1
+    # 第二天两座 L2 达标后停手，把第一张三级券留到第三天再买。
+    if turn.day_no < 3:
+        return None
+    # 第三天优先让其中一座 L2 升到 L3，再补第三座 L2。
+    if not any(tower.level >= 3 for tower in weapons) and any(
+        tower.level == 2 for tower in weapons
+    ):
         return WEAPON_UPGRADE_2
     if any(tower.level == 1 for tower in weapons):
         return WEAPON_UPGRADE_1
-    if level2:
+    if any(tower.level == 2 for tower in weapons):
         return WEAPON_UPGRADE_2
     return None
+
+
+def _priority_weapon_goal_pending(turn: Turn) -> bool:
+    """核心火力阶段目标未完成时，暂停墙体及其它非核心采购。"""
+    weapons = turn.weapons()
+    if len(weapons) < 3:
+        return False
+    if turn.day_no == 2:
+        return sum(1 for tower in weapons if tower.level >= 2) < 2
+    if turn.day_no == 3:
+        return not any(tower.level >= 3 for tower in weapons)
+    return False
 
 
 def _team_item_count(turn: Turn, name: str) -> int:
@@ -1627,6 +1654,10 @@ def _try_use_upgrade(
             commands[role.unit_id] = move_command(step)
             return True
 
+    # Day2 两座 L2、Day3 一座 L3 尚未完成时，不让基地券、墙券或修复包抢回合。
+    if _priority_weapon_goal_pending(turn):
+        return False
+
     station = turn.station()
     if station is not None:
         for voucher, need_level in (
@@ -1653,10 +1684,7 @@ def _try_use_upgrade(
                 commands[role.unit_id] = move_command(step)
                 return True
 
-    # 残血墙修复 / 围墙升级
-    if _fix_walls(turn, role, claimed, commands, walk=walk_walls):
-        return True
-
+    # 围墙升级优先于修复：Day2 残血一级墙直接升二级。
     for voucher, need_level in (
         (WALL_UPGRADE_1, 1),
         (WALL_UPGRADE_2, 2),
@@ -1694,6 +1722,9 @@ def _try_use_upgrade(
                 claimed.add(target.pos)
                 commands[role.unit_id] = move_command(step)
                 return True
+    # 没有可用墙升级券时才修复残墙。
+    if _fix_walls(turn, role, claimed, commands, walk=walk_walls):
+        return True
     return False
 
 
@@ -1779,15 +1810,17 @@ def _buy_wall_supplies(
 ) -> int | None:
     """白天去商店买墙券/修复包，返回花掉的金币；没有要买的返回 None。"""
     shop = turn.shop_pos()
-    if shop is None or not turn.is_day:
+    if shop is None or not turn.is_day or _priority_weapon_goal_pending(turn):
         return None
     want: tuple[str, int] | None = None
-    if _fixer_owed(turn):
+    owed = min(_wall_upgrades_owed(turn), WALL_VOUCHER_BATCH)
+    # 第一晚受损后，Day2 迎敌面直接升级：先买升级券，不先买修复包。
+    if turn.day_no == 2 and owed > 0:
+        want = (WALL_UPGRADE_1, owed)
+    elif _fixer_owed(turn):
         want = (WALL_FIXER, 1)
-    else:
-        owed = min(_wall_upgrades_owed(turn), WALL_VOUCHER_BATCH)
-        if owed > 0:
-            want = (WALL_UPGRADE_1, owed)
+    elif owed > 0:
+        want = (WALL_UPGRADE_1, owed)
     if want is None:
         return None
     name, num = want
@@ -1823,7 +1856,15 @@ def _fix_walls(
     fixer = role.find_item(WALL_FIXER)
     if not fixer:
         return False
-    damaged = [wall for wall in turn.walls() if _wall_damaged(wall)]
+    damaged = [
+        wall for wall in turn.walls()
+        if _wall_damaged(wall)
+        and not (
+            turn.day_no == 2
+            and wall.level == 1
+            and _wall_priority(turn, wall.pos) == 0
+        )
+    ]
     if not damaged:
         return False
     near = [wall for wall in damaged if distance(role.pos, wall.pos) <= 1]
@@ -1858,6 +1899,9 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
     copper = ores.get(COPPER, 0)
     iron = ores.get(IRON, 0)
     stone = ores.get(WALL_MATERIAL, 0)
+    # Day3 无条件清空铜铁，不受涨价、背包容量或当前金币限制。
+    if turn.day_no == 3 and (copper > 0 or iron > 0):
+        return True
     # 涨价日：有铁立刻卖
     if iron > 0 and dump_ore(turn, IRON):
         return True
@@ -1887,6 +1931,14 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
     return False
 
 
+def _day3_ores_left(turn: Turn, role: Unit) -> bool:
+    """第 3 天需要连续卖出的铜铁是否仍有剩余。"""
+    if turn.day_no != 3:
+        return False
+    ores = role.ore_counts()
+    return bool(ores.get(COPPER, 0) or ores.get(IRON, 0))
+
+
 def _sell_or_walk(
     turn: Turn,
     role: Unit,
@@ -1899,6 +1951,7 @@ def _sell_or_walk(
     ores = role.ore_counts()
     if not ores:
         return False
+    # 每条 sell 指令只能卖一种；Day3 会连续调用直到铜铁清空。
     # 卖货顺序：涨价矿 > 铜 > 铁；石头仅在背包满且没有铜铁时才卖超额部分
     sell_name = None
     sell_num = 0
@@ -2008,6 +2061,9 @@ def _wanted_purchase(
         item = can_buy(next_voucher, core=True)
         if item:
             return item
+    # Day2 两座 L2、Day3 一座 L3 未完成前，所有钱只留给武器升级。
+    if _priority_weapon_goal_pending(turn):
+        return None
     # 2) 基地保命升到 L2/L3
     if (
         station is not None and station.level == 1
