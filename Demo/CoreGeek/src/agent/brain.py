@@ -77,9 +77,9 @@ from .protocol import (
 )
 
 TOWER_LOADOUT = ("rocket", "rocket", "rocket")
-STONE_TARGET = 20  # 砌墙库存上限，够用即可
+STONE_TARGET = 5  # 全队常备约 5 块石头，墙被摧毁后立即补建
 DAY1_STONE_GOAL = 16  # 第一天先囤约 16 石再统一砌墙
-STONE_RESERVE = 20
+STONE_RESERVE = 5
 STONE_BATCH = 10
 MINE_BATCH = 8
 WEAPON_UPGRADE_RESERVE = 100
@@ -181,10 +181,22 @@ def _day(
                 ):
                     pass
                 elif (
+                    worker_walls is not free_walls
+                    and free_walls
+                    and _wall_work(
+                        turn, role, free_walls, claimed, commands, hunt_stone=False,
+                    )
+                ):
+                    # 本区剩余墙位暂时不可达时，立即跨区支援，不能困在墙内空转。
+                    pass
+                elif (
                     _day1_stone_accounted(turn) < DAY1_STONE_GOAL
                     and role.item_count(WALL_MATERIAL) == 0
                 ):
                     _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+                else:
+                    # 无可施工墙位时改采高价值矿，不原地待命。
+                    _fill_idle_mine(turn, role, claimed, commands)
             else:
                 _fill_idle_mine(
                     turn,
@@ -198,6 +210,22 @@ def _day(
 
 def _team_stone(turn: Turn) -> int:
     return sum(role.item_count(WALL_MATERIAL) for role in turn.controllable())
+
+
+def _destroyed_wall_sites(turn: Turn) -> list[Pos]:
+    """曾建成、现已消失的计划墙位，视为需要立即重建的缺口。"""
+    standing = {wall.pos for wall in turn.walls()}
+    planned = set(_wall_ring(turn))
+    return sorted(
+        (
+            pos for pos in wall_zone_seeds()
+            if pos in planned
+            and pos not in standing
+            and pos not in bad_build_cells()
+            and turn.land(pos)
+        ),
+        key=lambda pos: (_wall_priority(turn, pos), pos.x, pos.y),
+    )
 
 
 def _day1_wall_progress(turn: Turn) -> float:
@@ -375,6 +403,19 @@ def _worker_day(
     if not turn.near_night and _open_gate(turn, role, claimed, commands):
         return budget
 
+    # 3.5) 已建围墙被摧毁：购物、升炮、采经济矿之前立即补墙。
+    destroyed_walls = _destroyed_wall_sites(turn)
+    if destroyed_walls:
+        if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
+            turn, role, destroyed_walls, claimed, commands, hunt_stone=False,
+        ):
+            return budget
+        if (
+            _team_stone(turn) < STONE_TARGET
+            and _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+        ):
+            return budget
+
     # 4) 夜间临近：仅指定 1 名炮手回防，另一人继续挖矿
     if turn.near_night and turn.weapons() and night_gunner:
         if _man_tower(turn, role, claimed, commands):
@@ -455,9 +496,7 @@ def _worker_day(
         turn, role, walls_missing, claimed, commands,
     ):
         return budget
-    if not day1_iron and job == "mason" and _team_stone(turn) < STONE_TARGET and (
-        walls_missing or turn.day_no <= 2
-    ):
+    if not day1_iron and job == "mason" and _team_stone(turn) < STONE_TARGET:
         if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
             return budget
 
@@ -1231,6 +1270,17 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             elif cleared:
                 _buy_or_walk(turn, role, claimed, commands, turn.gold)
             continue
+        destroyed_walls = _destroyed_wall_sites(turn)
+        if destroyed_walls:
+            if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
+                turn, role, destroyed_walls, claimed, commands, hunt_stone=False,
+            ):
+                continue
+            if (
+                _team_stone(turn) < STONE_TARGET
+                and _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+            ):
+                continue
         # 工人夜里不守炮：有必要物品就采购，否则继续采矿。
         spent = _buy_or_walk(
             turn, role, claimed, commands, night_budget,
@@ -2228,12 +2278,23 @@ def _build_or_walk(
 ) -> bool:
     if target in bad_build_cells():
         return False
-    if role.pos != target and distance(role.pos, target) <= 1:
+    outside_only = name == WALL
+    can_build_here = (
+        role.pos != target
+        and distance(role.pos, target) <= 1
+        and (
+            not outside_only
+            or _is_outside_wall_stand(turn, role.pos, target)
+        )
+    )
+    if can_build_here:
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
         return True
     claimed.add(target)
-    step = _step_toward(turn, role, target, claimed)
+    step = _step_toward(
+        turn, role, target, claimed, outside_only=outside_only,
+    )
     if step is not None:
         commands[role.unit_id] = move_command(step)
         return True
@@ -2285,13 +2346,29 @@ def _step_toward(
     claimed: set[Pos],
     *,
     inside_only: bool = False,
+    outside_only: bool = False,
 ) -> Pos | None:
     avoid = set(failed_cells(role.unit_id)) | set(oscillation_bans(role.unit_id)) | claimed
     avoid.update(_robot_front_avoid(turn, role))
+    if outside_only:
+        station = turn.station()
+        if station is not None:
+            footprint = station_footprint(station.pos)
+            wall_radius = _footprint_distance(target, footprint)
+            if _footprint_distance(role.pos, footprint) > wall_radius:
+                # 已在墙外后，寻路也不得再穿过围墙内部抄近路。
+                avoid.update(
+                    Pos(x, y)
+                    for x in range(turn.width)
+                    for y in range(turn.height)
+                    if _footprint_distance(Pos(x, y), footprint) <= wall_radius
+                )
     avoid.discard(role.pos)
     # 夜里有怪时 A* 找不到路就原地待命；贪心乱走会挤进墙内贴着正面墙来回晃
     greedy = not _robots_attacking(turn)
-    for stand in _stand_cells(turn, role, target, claimed, inside_only):
+    for stand in _stand_cells(
+        turn, role, target, claimed, inside_only, outside_only,
+    ):
         if stand == role.pos:
             return None
         if stand in avoid and stand != target:
@@ -2303,6 +2380,9 @@ def _step_toward(
         if stand != role.pos:
             claimed.add(stand)
         return step
+    if outside_only:
+        # 砌墙绝不退回内侧或直接追墙位，避免角色被封进围墙。
+        return None
     step = next_step(turn, role, target, avoid, allow_greedy=greedy)
     if step is not None and step not in avoid:
         claimed.add(step)
@@ -2400,6 +2480,7 @@ def _stand_cells(
     target: Pos,
     claimed: set[Pos],
     inside_only: bool = False,
+    outside_only: bool = False,
 ) -> list[Pos]:
     station = turn.station()
     footprint = station_footprint(station.pos) if station else ()
@@ -2413,11 +2494,27 @@ def _stand_cells(
             not inside_only
             or _footprint_distance(pos, footprint) <= 1
         )
+        and (
+            not outside_only
+            or _footprint_distance(pos, footprint)
+            > _footprint_distance(target, footprint)
+        )
     ]
     cells.sort(
         key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y),
     )
     return cells
+
+
+def _is_outside_wall_stand(turn: Turn, stand: Pos, wall: Pos) -> bool:
+    station = turn.station()
+    if station is None:
+        return True
+    footprint = station_footprint(station.pos)
+    return (
+        _footprint_distance(stand, footprint)
+        > _footprint_distance(wall, footprint)
+    )
 
 
 def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
