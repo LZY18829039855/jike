@@ -120,6 +120,9 @@ class Memory:
     build_failures: dict[Pos, int] = field(default_factory=dict)
     good_wall: set[Pos] = field(default_factory=set)
     good_weapon: set[Pos] = field(default_factory=set)
+    # 开局选定的直角三炮位（含共用操控格），避免反复换点导致无法一格贴三炮
+    tower_plan: tuple[Pos, ...] = ()
+    tower_hub: Pos | None = None
     threat_x: int = 0
     threat_y: int = 0
     threat_n: int = 0
@@ -156,6 +159,8 @@ def reset_memory() -> None:
     MEM.build_failures.clear()
     MEM.good_wall.clear()
     MEM.good_weapon.clear()
+    MEM.tower_plan = ()
+    MEM.tower_hub = None
     MEM.threat_x = 0
     MEM.threat_y = 0
     MEM.threat_n = 0
