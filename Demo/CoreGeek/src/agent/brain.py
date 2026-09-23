@@ -286,6 +286,9 @@ def _rebuild_destroyed_walls(
     sites = _basic_wall_gaps(turn)
     if not sites:
         return False
+    # 还没砌出过墙：走固定施工链，不要把「从未建过」当成被砸缺口从前墙开砌
+    if not MEM.good_wall:
+        return False
     if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
         turn, role, sites, claimed, commands, hunt_stone=False,
     ):
@@ -380,8 +383,14 @@ def _day1_wall_lanes(
     workers: list[Unit],
     walls_missing: list[Pos],
 ) -> dict[int, list[Pos]]:
-    """两名工人固定分守上下施工区，完成本区后才支援另一侧。"""
-    if turn.day_no > 1 or len(workers) < 2 or not walls_missing:
+    """两名工人固定从上/下边最外侧开工，沿圈砌到迎敌左右面碰头。"""
+    if len(workers) < 2 or not walls_missing:
+        return {}
+    if (
+        turn.day_no > 1
+        and not _need_early_walls(turn)
+        and not _wall_completion_phase(turn)
+    ):
         return {}
     workers = sorted(workers[:2], key=lambda role: role.unit_id)
     worker_ids = {role.unit_id for role in workers}
@@ -389,37 +398,29 @@ def _day1_wall_lanes(
         set(MEM.wall_lane) == worker_ids
         and set(MEM.wall_lane.values()) == {"top", "bottom"}
     )
-    _front, top, bottom = _wall_build_plan(turn)
-    top_cells = set(top)
-    bottom_cells = set(bottom)
-    if not top_cells or not bottom_cells:
+    top_chain, bottom_chain = _mason_chains(turn)
+    if not top_chain or not bottom_chain:
         return {}
 
     if not lanes_valid:
         first, second = workers
-
-        def gap(role: Unit, cells: set[Pos]) -> int:
-            return min(distance(role.pos, pos) for pos in cells)
-
-        direct = gap(first, top_cells) + gap(second, bottom_cells)
-        swapped = gap(first, bottom_cells) + gap(second, top_cells)
+        top_stand = _preferred_wall_stand(turn, top_chain[0]) or top_chain[0]
+        bottom_stand = _preferred_wall_stand(turn, bottom_chain[0]) or bottom_chain[0]
+        direct = distance(first.pos, top_stand) + distance(second.pos, bottom_stand)
+        swapped = distance(first.pos, bottom_stand) + distance(second.pos, top_stand)
         if direct <= swapped:
             MEM.wall_lane = {first.unit_id: "top", second.unit_id: "bottom"}
         else:
             MEM.wall_lane = {first.unit_id: "bottom", second.unit_id: "top"}
 
-    def lane_of(pos: Pos) -> str:
-        top_gap = min(distance(pos, cell) for cell in top_cells)
-        bottom_gap = min(distance(pos, cell) for cell in bottom_cells)
-        return "top" if top_gap <= bottom_gap else "bottom"
-
+    missing = set(walls_missing)
     assigned: dict[int, list[Pos]] = {}
     for role in workers:
         lane = MEM.wall_lane[role.unit_id]
-        own = [pos for pos in walls_missing if lane_of(pos) == lane]
-        # 本区仍有缺口时禁止跨区；完成后再协助另一名工人。
-        assigned[role.unit_id] = own or [
-            pos for pos in walls_missing if lane_of(pos) != lane
+        own = top_chain if lane == "top" else bottom_chain
+        other = bottom_chain if lane == "top" else top_chain
+        assigned[role.unit_id] = [pos for pos in own if pos in missing] or [
+            pos for pos in reversed(other) if pos in missing
         ]
     return assigned
 
@@ -832,12 +833,8 @@ def _wall_work(
         return True
     if stones:
         pool = [site for site in walls_missing if site not in claimed]
-        # 能立刻动手的格子优先，别为了「理想墙位」空跑一路
-        adjacent = [
-            site for site in pool
-            if site != role.pos and distance(role.pos, site) <= 1
-        ]
-        for site in adjacent or pool:
+        # 严格按施工链：上/下边最外侧 → 左右面，不就近抢砌
+        for site in pool:
             if _build_or_walk(turn, role, site, WALL, claimed, commands):
                 return True
     if not hunt_stone:
@@ -2599,9 +2596,19 @@ def _build_or_walk(
         claimed.add(target)
         return True
     claimed.add(target)
-    step = _step_toward(
-        turn, role, target, claimed, outside_only=outside_only,
-    )
+    if outside_only:
+        stand = _preferred_wall_stand(turn, target)
+        step = None
+        if stand is not None and stand != role.pos:
+            step = _step_onto(turn, role, stand, claimed)
+        if step is None:
+            step = _step_toward(
+                turn, role, target, claimed, outside_only=True,
+            )
+    else:
+        step = _step_toward(
+            turn, role, target, claimed, outside_only=False,
+        )
     if step is not None:
         commands[role.unit_id] = move_command(step)
         return True
@@ -2836,10 +2843,13 @@ def _stand_cells(
     station = turn.station()
     footprint = station_footprint(station.pos) if station else ()
     blocked = turn.blocked(role)
+    planned = _planned_wall_cells(turn) if outside_only else set()
+    preferred = _preferred_wall_stand(turn, target) if outside_only else None
     cells = [
         pos for pos in _neighbours(target)
         if turn.land(pos)
         and pos not in blocked
+        and pos not in planned
         and (pos == role.pos or pos not in claimed)
         and (
             not inside_only
@@ -2852,12 +2862,95 @@ def _stand_cells(
         )
     ]
     cells.sort(
-        key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y),
+        key=lambda pos: (
+            0 if preferred is not None and pos == preferred else 1,
+            (
+                -_footprint_distance(pos, footprint)
+                if outside_only
+                else _footprint_distance(pos, footprint)
+            ),
+            pos.x,
+            pos.y,
+        ),
     )
     return cells
 
 
+def _planned_wall_cells(turn: Turn) -> set[Pos]:
+    """计划墙位（含基本围墙）禁止当作站位，避免踩上去再下来。"""
+    front, top, bottom, rear = _wall_face_cells(turn)
+    return set(front) | set(top) | set(bottom) | set(rear) | set(basic_wall_cells())
+
+
+def _preferred_wall_stand(turn: Turn, wall: Pos) -> Pos | None:
+    """墙格正外侧一格：上墙朝北、下墙朝南、右墙朝东、左墙朝西。"""
+    station = turn.station()
+    if station is None:
+        return None
+    footprint = station_footprint(station.pos)
+    xs = [cell.x for cell in footprint]
+    ys = [cell.y for cell in footprint]
+    xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+    if wall.y == ymax + 2:
+        stand = Pos(wall.x, wall.y + 1)
+    elif wall.y == ymin - 2:
+        stand = Pos(wall.x, wall.y - 1)
+    elif wall.x == xmax + 2:
+        stand = Pos(wall.x + 1, wall.y)
+    elif wall.x == xmin - 2:
+        stand = Pos(wall.x - 1, wall.y)
+    else:
+        axial = (
+            Pos(wall.x + 1, wall.y),
+            Pos(wall.x - 1, wall.y),
+            Pos(wall.x, wall.y + 1),
+            Pos(wall.x, wall.y - 1),
+        )
+        stand = max(axial, key=lambda pos: _footprint_distance(pos, footprint))
+        if _footprint_distance(stand, footprint) <= _footprint_distance(wall, footprint):
+            return None
+    if not turn.land(stand):
+        return None
+    return stand
+
+
+def _mason_chains(turn: Turn) -> tuple[list[Pos], list[Pos]]:
+    """写死施工链：上边最外侧 → 迎敌左右面；下边最外侧 → 迎敌左右面，中间碰头。"""
+    front, top, bottom = _wall_build_plan(turn)
+    reserved = _weapon_keep_open(turn)
+    banned = bad_build_cells()
+    nw = _base_is_northwest(turn)
+
+    def clean(cells: list[Pos]) -> list[Pos]:
+        seen: set[Pos] = set()
+        out: list[Pos] = []
+        for pos in cells:
+            if pos in seen or pos in reserved or pos in banned:
+                continue
+            if not turn.land(pos):
+                continue
+            seen.add(pos)
+            out.append(pos)
+        return out
+
+    if nw:
+        top_arm = sorted(top, key=lambda pos: (pos.x, pos.y))
+        bottom_arm = sorted(bottom, key=lambda pos: (pos.x, -pos.y))
+        front_down = sorted(front, key=lambda pos: (-pos.y, pos.x))
+    else:
+        top_arm = sorted(top, key=lambda pos: (-pos.x, pos.y))
+        bottom_arm = sorted(bottom, key=lambda pos: (-pos.x, -pos.y))
+        front_down = sorted(front, key=lambda pos: (-pos.y, -pos.x))
+
+    mid = (len(front_down) + 1) // 2
+    top_front = front_down[:mid]
+    bottom_front = list(reversed(front_down[mid:]))
+    return clean([*top_arm, *top_front]), clean([*bottom_arm, *bottom_front])
+
+
 def _is_outside_wall_stand(turn: Turn, stand: Pos, wall: Pos) -> bool:
+    if stand == wall or stand in _planned_wall_cells(turn):
+        return False
     station = turn.station()
     if station is None:
         return True
@@ -3125,56 +3218,12 @@ def _gate_cell(turn: Turn) -> Pos | None:
 
 
 def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
-    """建造顺序：来敌面 → 上侧 → 下侧；Day1 砌满三面后再去挖铁。"""
+    """建造顺序：上边最外侧、下边最外侧各一条链，砌到迎敌左右面碰头。"""
     del seal
-    station = turn.station()
-    if station is None:
+    if turn.station() is None:
         return ()
-    front, top, bottom = _wall_build_plan(turn)
-    face_rank: dict[Pos, int] = {}
-    for pos in front:
-        face_rank[pos] = 0
-    for pos in top:
-        face_rank.setdefault(pos, 1)
-    for pos in bottom:
-        face_rank.setdefault(pos, 2)
-
-    ring = _wall_ring(turn)
-    seeds = wall_zone_seeds()
-    keep_open = _weapon_keep_open(turn)
-    frontier = {
-        pos for seed in seeds for pos in _neighbours(seed)
-        if turn.land(pos) and pos not in seeds and pos not in keep_open
-    }
-    banned = bad_build_cells()
-    anchor = threat_anchor(turn)
-    footprint = station_footprint(station.pos)
-    core = set(face_rank)
-
-    filtered: list[Pos] = []
-    for pos in {*ring, *frontier}:
-        if pos in banned or pos in keep_open:
-            continue
-        # 只收核心计划内格子，或紧贴核心、仍靠来敌侧的邻格（黄区试探）
-        if pos in core:
-            filtered.append(pos)
-            continue
-        if pos not in frontier:
-            continue
-        if any(distance(pos, cell) <= 1 for cell in core):
-            filtered.append(pos)
-
-    filtered.sort(
-        key=lambda pos: (
-            face_rank.get(pos, 3),
-            0 if pos in ring else 1,
-            distance(pos, anchor),
-            _footprint_distance(pos, footprint),
-            pos.x,
-            pos.y,
-        ),
-    )
-    return tuple(dict.fromkeys(filtered))[:20]
+    top_chain, bottom_chain = _mason_chains(turn)
+    return tuple(dict.fromkeys([*top_chain, *bottom_chain]))[:20]
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:

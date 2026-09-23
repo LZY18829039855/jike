@@ -116,7 +116,7 @@ class Memory:
     pending_buy: dict[str, tuple[int, int]] = field(default_factory=dict)
     # 武器升级券固定由一名工人采购，避免两人重复跑商店
     weapon_buyer_id: int | None = None
-    # Day1 两名工人的围墙施工区：top / bottom
+    # 两名工人的围墙施工区：top / bottom（从上/下边最外侧砌到左右面碰头）
     wall_lane: dict[int, str] = field(default_factory=dict)
     # 采卖计划：unit -> (矿种, 目标数量)
     mine_quota: dict[int, tuple[str, int]] = field(default_factory=dict)
