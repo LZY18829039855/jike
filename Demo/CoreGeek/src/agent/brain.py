@@ -34,7 +34,6 @@ from .intel import (
     threat_anchor,
     wall_zone_seeds,
     weapon_ready,
-    weapon_zone_seeds,
     treasure_ready,
 )
 from .protocol import (
@@ -315,7 +314,8 @@ def _worker_day(
         if _man_tower(turn, role, claimed, commands):
             return budget
 
-    # 5) 开局并行：先凑满 3 座火箭炮，避免整晚无火力
+    # 5) 凑满 3 座火箭。Day1 墙未齐时只在已经贴着炮位时建造，避免满图追炮闲逛
+    early_walls = _need_early_walls(turn)
     if towers_missing and budget >= WEAPON_BUILD_COST:
         candidates = [
             (index, site) for index, site in enumerate(sites)
@@ -326,31 +326,26 @@ def _worker_day(
                 item for item in candidates
                 if distance(role.pos, item[1]) <= 1 and role.pos != item[1]
             ]
-            pool = adjacent or candidates
-            index, site = min(
-                pool,
-                key=lambda item: (
-                    0 if item in adjacent else 1,
-                    distance(role.pos, item[1]),
-                    item[0],
-                ),
-            )
-            if _build_or_walk(
-                turn, role, site, TOWER_LOADOUT[min(index, 2)], claimed, commands,
-            ):
-                if distance(role.pos, site) <= 1 and role.pos != site:
-                    return budget - WEAPON_BUILD_COST
-                return budget
+            if adjacent or not early_walls:
+                pool = adjacent or candidates
+                index, site = min(
+                    pool,
+                    key=lambda item: (
+                        0 if item in adjacent else 1,
+                        distance(role.pos, item[1]),
+                        item[0],
+                    ),
+                )
+                if _build_or_walk(
+                    turn, role, site, TOWER_LOADOUT[min(index, 2)], claimed, commands,
+                ):
+                    if distance(role.pos, site) <= 1 and role.pos != site:
+                        return budget - WEAPON_BUILD_COST
+                    return budget
 
-    # 5.4) Day1 炮未齐：没轮上建炮的人先去采石，别提前挖铜铁
-    if _need_early_walls(turn) and towers_missing:
-        if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
-            return budget
-
-    # 5.5) 三炮齐后：Day1 先囤约 16 石 → 砌齐三面墙，再挖铁
+    # 5.5) Day1：先囤约 16 石 → 砌齐三面墙，不等三炮齐
     fire_ready = _firepower_ready(turn)
-    early_walls = _need_early_walls(turn)
-    if early_walls and len(turn.weapons()) >= 3:
+    if early_walls:
         if _day1_stockpiling_stone(turn):
             if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
                 return budget
@@ -1951,55 +1946,35 @@ def _stand_cells(
     return cells
 
 
+# 右下基地：以基地左下角格子为 (0,0)
+# 炮 (4,2)、(5,2)、(5,4)，角色站 (5,3) 同时贴住三座
+_SE_TOWER_LOCAL = ((4, 2), (5, 2), (5, 4))
+_SE_HUB_LOCAL = (5, 3)
+
+
 def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
-    """三炮直角簇：锁定 2x2 缺一角，共用操控格，夜战一人原地轮流开火。"""
+    """固定直角三炮：右下按左下角偏移；左上上下对称。"""
     station = turn.station()
     if station is None:
         return ()
-    standing = [unit.pos for unit in turn.weapons()]
-    banned = bad_build_cells()
-    # 已有锁定方案且仍合法：继续补齐缺位
-    if len(MEM.tower_plan) == 3:
-        plan = tuple(MEM.tower_plan)
-        if _is_compact_l(list(plan)) and all(
-            pos not in banned or pos in standing for pos in plan
-        ):
-            missing = [pos for pos in plan if pos not in standing]
-            if len(standing) + len(missing) <= 3:
-                return plan
-
-    # 已有炮：尽量在其旁补成直角
-    cluster = _best_tower_l_cluster(turn, standing, banned)
-    if len(cluster) >= 3:
-        MEM.tower_plan = tuple(cluster[:3])
-        MEM.tower_hub = _hub_of_l(list(MEM.tower_plan))
-        return MEM.tower_plan
-
-    # 全新选点：在基地外扩环上搜所有 2x2 直角，朝来敌方向优先
-    cluster = _best_tower_l_cluster(turn, [], banned)
-    if len(cluster) >= 3:
-        MEM.tower_plan = tuple(cluster[:3])
-        MEM.tower_hub = _hub_of_l(list(MEM.tower_plan))
-        return MEM.tower_plan
-
-    # 回退：已有炮位 + 朝威胁最近的空地
-    seeds = weapon_zone_seeds()
-    anchor = threat_anchor(turn)
-    pool: list[Pos] = list(standing)
-    for radius in (1, 2, 3):
-        for pos in _cells_at_distance(station.pos, radius):
-            if turn.land(pos) and pos not in banned and pos not in pool:
-                pool.append(pos)
-    pool.sort(
-        key=lambda pos: (
-            0 if pos in standing else 1,
-            0 if pos in seeds else 1,
-            distance(pos, anchor),
-            pos.x,
-            pos.y,
-        ),
-    )
-    return tuple(pool[:3])
+    footprint = station_footprint(station.pos)
+    origin_x = min(pos.x for pos in footprint)
+    origin_y = min(pos.y for pos in footprint)
+    if _base_is_northwest(turn):
+        # 以基地水平中线对称，炮群改到基地下方（朝地图中心）
+        towers = tuple(
+            Pos(origin_x + dx, origin_y + (1 - dy)) for dx, dy in _SE_TOWER_LOCAL
+        )
+        hx, hy = _SE_HUB_LOCAL
+        hub = Pos(origin_x + hx, origin_y + (1 - hy))
+    else:
+        towers = tuple(
+            Pos(origin_x + dx, origin_y + dy) for dx, dy in _SE_TOWER_LOCAL
+        )
+        hub = Pos(origin_x + _SE_HUB_LOCAL[0], origin_y + _SE_HUB_LOCAL[1])
+    MEM.tower_plan = towers
+    MEM.tower_hub = hub
+    return towers
 
 
 def _hub_of_l(cells: list[Pos]) -> Pos | None:
@@ -2014,80 +1989,6 @@ def _hub_of_l(cells: list[Pos]) -> Pos | None:
             if hub not in cells:
                 return hub
     return None
-
-
-def _best_tower_l_cluster(
-    turn: Turn,
-    standing: list[Pos],
-    banned: frozenset[Pos],
-) -> list[Pos]:
-    """枚举基地附近 2x2，取缺一角为操控格的直角三炮。"""
-    station = turn.station()
-    if station is None:
-        return []
-    footprint = set(station_footprint(station.pos))
-    anchor = threat_anchor(turn)
-    seeds = weapon_zone_seeds()
-    wall_ring = set(_wall_ring(turn))
-
-    # 搜索窗口：基地外扩 1～3 圈的矩形
-    xs = [pos.x for pos in footprint]
-    ys = [pos.y for pos in footprint]
-    best: list[Pos] = []
-    best_key: tuple | None = None
-    standing_set = set(standing)
-
-    for radius in (1, 2, 3):
-        x0, x1 = min(xs) - radius, max(xs) + radius
-        y0, y1 = min(ys) - radius, max(ys) + radius
-        for x in range(x0, x1):
-            for y in range(y0, y1):
-                block = (Pos(x, y), Pos(x + 1, y), Pos(x, y + 1), Pos(x + 1, y + 1))
-                if any(
-                    not (0 <= p.x < turn.width and 0 <= p.y < turn.height)
-                    for p in block
-                ):
-                    continue
-                if any(not turn.land(p) for p in block):
-                    continue
-                if any(p in footprint for p in block):
-                    continue
-                # 四个缺角方案：三格建炮，一格当枢纽
-                for hub_idx in range(4):
-                    hub = block[hub_idx]
-                    trio = [block[i] for i in range(4) if i != hub_idx]
-                    if not _is_compact_l(trio):
-                        continue
-                    # 枢纽不能已是炮，且需可站立（允许在未来墙环上，建墙时会让路）
-                    if hub in banned:
-                        continue
-                    if hub in standing_set:
-                        continue
-                    if any(pos in banned and pos not in standing_set for pos in trio):
-                        continue
-                    # 已有炮必须落在本直角内（或尚无炮）
-                    if standing and not set(standing).issubset(set(trio)):
-                        continue
-                    # 朝来敌：枢纽尽量靠威胁侧，且不与炮位争格
-                    toward = -distance(hub, anchor) - sum(
-                        distance(pos, anchor) for pos in trio
-                    )
-                    covered_standing = sum(1 for pos in standing if pos in trio)
-                    # 炮/枢纽落在墙环上要扣分，但仍允许（建墙会让路）
-                    wall_hit = sum(1 for pos in (*trio, hub) if pos in wall_ring)
-                    key = (
-                        covered_standing,
-                        1 if len(standing) == 0 or covered_standing == len(standing) else 0,
-                        toward,
-                        -wall_hit,
-                        sum(1 for pos in trio if pos in seeds),
-                        -hub.x,
-                        -hub.y,
-                    )
-                    if best_key is None or key > best_key:
-                        best_key = key
-                        best = trio
-    return best
 
 
 def _is_compact_l(cells: list[Pos]) -> bool:
