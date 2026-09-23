@@ -81,7 +81,8 @@ from .protocol import (
 
 TOWER_LOADOUT = ("rocket", "rocket", "rocket")
 STONE_TARGET = 5  # 全队常备约 5 块石头，墙被摧毁后立即补建
-DAY1_STONE_GOAL = 16  # 第一天先囤约 16 石再统一砌墙
+# 每个石矿采满 10 次消失；Day1 每名工人先采满 10 石再回去砌墙
+DAY1_STONE_PER_WORKER = 10
 STONE_RESERVE = 5
 STONE_BATCH = 10
 MINE_BATCH = 8
@@ -229,17 +230,9 @@ def _destroyed_wall_sites(turn: Turn) -> list[Pos]:
 
 
 def _full_wall_ring(turn: Turn) -> tuple[Pos, ...]:
-    """第一天规格的三面满墙（迎敌面 + 上下满长），炮旁留通行格。"""
-    front, top, bottom, _rear = _wall_face_cells(turn)
-    reserved = _weapon_keep_open(turn)
-    seen: set[Pos] = set()
-    out: list[Pos] = []
-    for pos in (*front, *top, *bottom):
-        if pos in seen or not turn.land(pos) or pos in reserved:
-            continue
-        seen.add(pos)
-        out.append(pos)
-    return tuple(out)
+    """第一天基本墙：上下边满长 + 迎敌面各拐 3 格（双人施工链并集）。"""
+    top_chain, bottom_chain = _day1_mason_chains(turn)
+    return tuple(dict.fromkeys([*top_chain, *bottom_chain]))
 
 
 def _lock_basic_wall(turn: Turn) -> None:
@@ -300,32 +293,31 @@ def _rebuild_destroyed_walls(
 
 
 def _day1_wall_progress(turn: Turn) -> float:
-    """迎敌面 + 上下两面（满长合计约 16 格）的完工比例。"""
+    """Day1 双链目标墙的完工比例。"""
     _, progress = _ring_progress(turn)
     return progress
 
 
 def _need_early_walls(turn: Turn) -> bool:
-    """第一天三面墙未齐前，优先囤石砌墙，再挖铁。"""
+    """第一天双链墙未齐前，优先采石砌墙，再挖铁。"""
     if turn.day_no > 1:
         return False
     return _day1_wall_progress(turn) < 0.95
 
 
-def _day1_stone_accounted(turn: Turn) -> int:
-    """背包里的石头 + 已经砌上的三面墙，避免砌掉后又把目标刷回 16。"""
-    ring = set(_wall_ring(turn))
-    built = sum(1 for unit in turn.walls() if unit.pos in ring)
-    return _team_stone(turn) + built
-
-
-def _day1_stockpiling_stone(turn: Turn) -> bool:
-    """Day1：累计约 16 石（含已砌）之前先采石；够了就停，不再回矿补货。"""
-    if not _need_early_walls(turn):
+def _day1_should_mine_stone(
+    turn: Turn, role: Unit, walls_missing: list[Pos],
+) -> bool:
+    """Day1：每人先采满 10 石再砌；石头用完或本链砌完后再去采下一批 10。"""
+    if turn.day_no > 1 or not _need_early_walls(turn):
         return False
-    if _day1_stone_accounted(turn) >= DAY1_STONE_GOAL:
+    stones = role.item_count(WALL_MATERIAL)
+    if stones >= DAY1_STONE_PER_WORKER:
         return False
-    return _team_stone(turn) < DAY1_STONE_GOAL
+    # 包里还有石头且本链仍有缺口 → 继续砌，不中途回矿
+    if stones > 0 and walls_missing:
+        return False
+    return True
 
 
 def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
@@ -1899,24 +1891,30 @@ def _try_use_upgrade(
                 commands[role.unit_id] = move_command(step)
                 return True
 
-    # 围墙升级：迎敌左右面 4 块先一路升到 3 级，未完成前不升上下面。
+    # 围墙升级：迎敌左右面从中间向上下蔓延升 2 级；3 级落后 2 块。
+    front_rank = {
+        pos: index for index, pos in enumerate(_front_upgrade_order(turn))
+    }
     front_below3 = _front_walls_below3(turn)
-    voucher_order = (
-        ((WALL_UPGRADE_2, 2), (WALL_UPGRADE_1, 1))
-        if front_below3
-        else ((WALL_UPGRADE_1, 1), (WALL_UPGRADE_2, 2))
-    )
-    for voucher, need_level in voucher_order:
+    if front_below3:
+        # 先补到期的 3 级，再继续向外扩 2 级
+        voucher_pools = (
+            (WALL_UPGRADE_2, _front_l3_targets(turn)),
+            (WALL_UPGRADE_1, _front_l2_targets(turn)),
+        )
+    else:
+        voucher_pools = (
+            (WALL_UPGRADE_1, [
+                wall for wall in turn.walls() if wall.level == 1
+            ]),
+            (WALL_UPGRADE_2, [
+                wall for wall in turn.walls() if wall.level == 2
+            ]),
+        )
+    for voucher, pool in voucher_pools:
         item = role.find_item(voucher)
-        if not item:
+        if not item or not pool:
             continue
-        if front_below3:
-            pool = [wall for wall in front_below3 if wall.level == need_level]
-        else:
-            pool = [
-                wall for wall in turn.walls()
-                if wall.level == need_level
-            ]
         near = [
             wall for wall in pool
             if distance(role.pos, wall.pos) <= 1
@@ -1924,7 +1922,11 @@ def _try_use_upgrade(
         if near:
             wall = min(
                 near,
-                key=lambda unit: (_wall_priority(turn, unit.pos), unit.health),
+                key=lambda unit: (
+                    front_rank.get(unit.pos, 99),
+                    _wall_priority(turn, unit.pos),
+                    unit.health,
+                ),
             )
             MEM.use_target.pop(role.unit_id, None)
             commands[role.unit_id] = use_command(item, wall.pos)
@@ -1936,6 +1938,7 @@ def _try_use_upgrade(
             (wall for wall in pool if wall.pos not in claimed),
             key=lambda unit: (
                 0 if locked is not None and unit.pos == locked else 1,
+                front_rank.get(unit.pos, 99),
                 _wall_priority(turn, unit.pos),
                 distance(role.pos, unit.pos),
             ),
@@ -1995,6 +1998,8 @@ WALL_FIXER_FROM_DAY = 2
 WALL_VOUCHER_BATCH = 4
 FIXER_BATCH = 3
 WALL_DAMAGED_RATIO = 0.8
+# 迎敌面升 3 级比升 2 级落后两块：升第 N 块到 2 级时，升第 N-2 块到 3 级
+FRONT_L3_LAG = 2
 
 
 def _wall_priority(turn: Turn, pos: Pos) -> int:
@@ -2007,21 +2012,66 @@ def _wall_priority(turn: Turn, pos: Pos) -> int:
     return 2
 
 
+def _front_upgrade_order(turn: Turn) -> list[Pos]:
+    """迎敌左右面升级顺序：从中间向上下两侧蔓延。"""
+    front, _top, _bottom, _rear = _wall_face_cells(turn)
+    if not front:
+        return []
+    xs = {pos.x for pos in front}
+    if len(xs) == 1:
+        axis = sorted(front, key=lambda pos: pos.y)
+    else:
+        axis = sorted(front, key=lambda pos: (pos.x, pos.y))
+    center = (len(axis) - 1) / 2.0
+    ranked = sorted(range(len(axis)), key=lambda i: (abs(i - center), i))
+    return [axis[i] for i in ranked]
+
+
 def _front_walls_below3(turn: Turn) -> list[Unit]:
     """迎敌左右面尚未到 3 级的墙（正面固定 4 块）。"""
-    front = _front_wall_cells(turn)
+    front = set(_front_upgrade_order(turn))
     return [
         wall for wall in turn.walls()
         if wall.pos in front and wall.level < 3
     ]
 
 
+def _front_l2_targets(turn: Turn) -> list[Unit]:
+    """下一波该升到 2 级的迎敌墙（中间向外）。"""
+    by_pos = {wall.pos: wall for wall in turn.walls()}
+    return [
+        by_pos[pos] for pos in _front_upgrade_order(turn)
+        if pos in by_pos and by_pos[pos].level == 1
+    ]
+
+
+def _front_l3_targets(turn: Turn) -> list[Unit]:
+    """可升到 3 级的迎敌墙：比 2 级落后 FRONT_L3_LAG 块。
+
+    已有 k 块 ≥2 级时，顺序前 max(0, k-2) 块若仍是 2 级则可升 3；
+    全部 ≥2 后，剩余 2 级也按同一顺序升 3。
+    """
+    order = _front_upgrade_order(turn)
+    by_pos = {wall.pos: wall for wall in turn.walls()}
+    levels = [
+        by_pos[pos].level if pos in by_pos else 0
+        for pos in order
+    ]
+    done_l2 = sum(1 for level in levels if level >= 2)
+    limit = len(order) if done_l2 >= len(order) else max(0, done_l2 - FRONT_L3_LAG)
+    return [
+        by_pos[pos] for index, pos in enumerate(order)
+        if index < limit and pos in by_pos and by_pos[pos].level == 2
+    ]
+
+
 def _front_walls_needing_upgrade(turn: Turn, need_level: int) -> list[Unit]:
     """迎敌正面（左右面）上仍待升级的墙。"""
-    return [
-        wall for wall in _front_walls_below3(turn)
-        if wall.level == need_level
-    ]
+    if need_level == 1:
+        return _front_l2_targets(turn)
+    if need_level == 2:
+        return _front_l3_targets(turn)
+    return []
 
 
 def _wall_damaged(wall: Unit) -> bool:
@@ -2033,22 +2083,24 @@ def _team_items(turn: Turn, name: str) -> int:
 
 
 def _front_wall_upgrade_want(turn: Turn) -> tuple[str, int] | None:
-    """迎敌 4 块未到 3 级时，只买把它们送到 3 级的券。"""
+    """迎敌面按中间外扩买券：到期的 3 级券优先，再买继续外扩的 2 级券。"""
     if not _wall_completion_phase(turn):
         return None
-    l1 = sum(1 for wall in _front_walls_below3(turn) if wall.level == 1)
-    l2 = sum(1 for wall in _front_walls_below3(turn) if wall.level == 2)
-    if l1:
-        owed = max(0, l1 - _team_items(turn, WALL_UPGRADE_1))
-        return (WALL_UPGRADE_1, owed) if owed else None
-    if l2:
-        owed = max(0, l2 - _team_items(turn, WALL_UPGRADE_2))
-        return (WALL_UPGRADE_2, owed) if owed else None
+    l3_todo = len(_front_l3_targets(turn))
+    if l3_todo:
+        owed = max(0, l3_todo - _team_items(turn, WALL_UPGRADE_2))
+        if owed:
+            return WALL_UPGRADE_2, owed
+    l2_todo = len(_front_l2_targets(turn))
+    if l2_todo:
+        owed = max(0, l2_todo - _team_items(turn, WALL_UPGRADE_1))
+        if owed:
+            return WALL_UPGRADE_1, owed
     return None
 
 
 def _wall_upgrades_owed(turn: Turn) -> tuple[str, int] | None:
-    """先把迎敌左右面 4 块升到 3 级；正面完成后再补其余基本围墙的二级券。"""
+    """先把迎敌左右面按中间外扩升到 3 级；正面完成后再补其余基本围墙。"""
     front_want = _front_wall_upgrade_want(turn)
     if front_want is not None:
         return front_want
