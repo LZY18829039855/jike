@@ -218,6 +218,10 @@ def observe(turn: Turn) -> None:
         MEM.summon_day = turn.day_no
         MEM.summon_used = 0
 
+    # 天亮后清掉基本墙误伤黑名单，保证白天能把缺口砌回去
+    if turn.is_day:
+        _release_basic_wall_blacklist()
+
     _observe_threat(turn)
     apply_fixed_treasure()
     apply_fixed_iron_schedule(turn)
@@ -328,10 +332,14 @@ def _observe_moves(turn: Turn) -> None:
             MEM.bad_build.discard(site)
             MEM.build_failures.pop(site, None)
         else:
+            # 黑夜禁止建造，失败属规则限制，绝不记入非法建造区
+            if not turn.is_day:
+                continue
             failures = MEM.build_failures.get(site, 0) + 1
             MEM.build_failures[site] = failures
             # 一次失败可能只是临时占格；重复失败才认定为非法建造区。
-            if failures >= 2:
+            # 基本墙位 Day1 已验证可建，永不拉黑，避免缺口白天补不回。
+            if failures >= 2 and site not in MEM.basic_wall:
                 MEM.bad_build.add(site)
 
 
@@ -462,6 +470,16 @@ def failed_cells(unit_id: int) -> frozenset[Pos]:
 
 def bad_build_cells() -> frozenset[Pos]:
     return frozenset(MEM.bad_build)
+
+
+def _release_basic_wall_blacklist() -> None:
+    """基本墙坐标已在白天成功建过，禁止因夜建失败等误伤永久拉黑。"""
+    if not MEM.basic_wall:
+        return
+    for pos in list(MEM.bad_build):
+        if pos in MEM.basic_wall:
+            MEM.bad_build.discard(pos)
+            MEM.build_failures.pop(pos, None)
 
 
 def _observe_zones(turn: Turn) -> None:

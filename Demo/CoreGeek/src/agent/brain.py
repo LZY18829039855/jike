@@ -141,7 +141,7 @@ def _day(
         towers_missing = [
             pos for pos in sites if pos not in standing_towers
         ][: 3 - len(standing_towers)]
-    # 基本围墙缺口永远排在白天施工最前，确保每天优先保全
+    # 基本围墙缺口永远排在白天施工最前，确保每天优先完善
     basic_gaps = _basic_wall_gaps(turn)
     walls_missing = list(dict.fromkeys(
         [*basic_gaps, *[pos for pos in order if pos not in standing_walls]],
@@ -280,7 +280,9 @@ def _rebuild_destroyed_walls(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """基本围墙变空地后立刻新建：有石头去砌，没石头去采。"""
+    """白天完善基本墙：缺口优先新建。黑夜禁止 build，只能用修复包修残墙。"""
+    if not turn.is_day:
+        return False
     if role.kind != WORKER:
         return False
     sites = _basic_wall_gaps(turn)
@@ -289,11 +291,11 @@ def _rebuild_destroyed_walls(
     # 还没砌出过墙：走固定施工链，不要把「从未建过」当成被砸缺口从前墙开砌
     if not MEM.good_wall:
         return False
-    if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
-        turn, role, sites, claimed, commands, hunt_stone=False,
-    ):
-        return True
-    # 全队缺墙时人人去采石补缺口，不要求自己包里已有石头
+    # 有石头就去砌/贴缺口，不要改去挖别的矿；没石头才采石
+    if role.item_count(WALL_MATERIAL) > 0:
+        return _wall_work(
+            turn, role, sites, claimed, commands, hunt_stone=False,
+        )
     return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
 
 
@@ -466,7 +468,7 @@ def _worker_day(
             commands[role.unit_id] = use_command(med)
             return budget
 
-    # 1.5) 围墙被打烂：先于卖矿、升炮、用券、购物，立刻新建缺口。
+    # 1.5) 白天最高优先：基本墙有缺口则立刻建墙完善，先于卖矿/升炮/用券/购物。
     if _rebuild_destroyed_walls(turn, role, claimed, commands):
         return budget
 
@@ -534,6 +536,11 @@ def _worker_day(
             if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
                 return budget
             return budget
+        # 第一天墙未齐也要抽出买 1 张二级券，避免拖到第二天
+        if turn.weapons() and _prefer_weapon_upgrade(turn, role, budget):
+            spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
+            if spent is not None:
+                return budget - spent
         if walls_missing and _wall_work(
             turn, role, walls_missing, claimed, commands, hunt_stone=False,
         ):
@@ -555,7 +562,7 @@ def _worker_day(
         if spent is not None:
             return budget - spent
 
-    if len(turn.weapons()) >= 3 and not fire_ready:
+    if turn.weapons() and not fire_ready:
         if _prefer_weapon_upgrade(turn, role, budget):
             spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
             if spent is not None:
@@ -655,15 +662,22 @@ def _front_wall_cells(turn: Turn) -> set[Pos]:
     return set(front)
 
 
+def _weapon_l2_goal(turn: Turn) -> int:
+    """第一天只升 1 座到 2 级；第二天起三座都要 2 级。"""
+    if turn.day_no <= 1:
+        return 1
+    return 3
+
+
 def _next_weapon_voucher(turn: Turn) -> str | None:
-    """按阶段目标选择下一张武器券：Day2 两座 L2，Day3 先出一座 L3。"""
+    """按阶段目标选券：Day1 一座 L2，Day2 其余两座 L2，Day3 一座 L3。"""
     weapons = turn.weapons()
     if not weapons:
         return None
     upgraded = sum(1 for tower in weapons if tower.level >= 2)
-    if upgraded < 2 and any(tower.level == 1 for tower in weapons):
+    if upgraded < _weapon_l2_goal(turn) and any(tower.level == 1 for tower in weapons):
         return WEAPON_UPGRADE_1
-    # 第二天两座 L2 达标后停手，把第一张三级券留到第三天再买。
+    # 当天的二级目标完成后，三级券留到第三天再买。
     if turn.day_no < 3:
         return None
     # 第三天优先让其中一座 L2 升到 L3。
@@ -682,10 +696,18 @@ def _next_weapon_voucher(turn: Turn) -> str | None:
 def _priority_weapon_goal_pending(turn: Turn) -> bool:
     """核心火力阶段目标未完成时，暂停墙体及其它非核心采购。"""
     weapons = turn.weapons()
-    if len(weapons) < 3:
+    if not weapons:
         return False
+    if turn.day_no <= 1:
+        return (
+            any(tower.level == 1 for tower in weapons)
+            and sum(1 for tower in weapons if tower.level >= 2) < 1
+        )
     if turn.day_no == 2:
-        return sum(1 for tower in weapons if tower.level >= 2) < 2
+        return (
+            len(weapons) >= 3
+            and sum(1 for tower in weapons if tower.level >= 2) < 3
+        )
     if turn.day_no == 3:
         return not any(tower.level >= 3 for tower in weapons)
     return False
@@ -1487,9 +1509,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             else:
                 _solo_rocket_fire(turn, role, claimed, commands)
             continue
-        # 围墙被打烂先新建；残墙再拿修复包补。夜里寻路不越正面墙、不贴机器人。
-        if _rebuild_destroyed_walls(turn, role, claimed, commands):
-            continue
+        # 黑夜禁止建造；残墙只能用修复包补血。寻路不越正面墙、不贴机器人。
         if _fix_walls(turn, role, claimed, commands):
             continue
         if role.kind != WORKER:
@@ -1849,7 +1869,7 @@ def _try_use_upgrade(
             commands[role.unit_id] = move_command(step)
             return True
 
-    # Day2 两座 L2、Day3 一座 L3 尚未完成时，不让基地券、墙券或修复包抢回合。
+    # Day1 一座 L2、Day2 三座 L2、Day3 一座 L3 尚未完成时，不让其它券抢回合。
     if _priority_weapon_goal_pending(turn):
         return False
 
@@ -1879,20 +1899,24 @@ def _try_use_upgrade(
                 commands[role.unit_id] = move_command(step)
                 return True
 
-    # 围墙升级优先于修复：迎敌左右面未升完前，不升上下面。
-    for voucher, need_level in (
-        (WALL_UPGRADE_1, 1),
-        (WALL_UPGRADE_2, 2),
-    ):
+    # 围墙升级：迎敌左右面 4 块先一路升到 3 级，未完成前不升上下面。
+    front_below3 = _front_walls_below3(turn)
+    voucher_order = (
+        ((WALL_UPGRADE_2, 2), (WALL_UPGRADE_1, 1))
+        if front_below3
+        else ((WALL_UPGRADE_1, 1), (WALL_UPGRADE_2, 2))
+    )
+    for voucher, need_level in voucher_order:
         item = role.find_item(voucher)
         if not item:
             continue
-        front_todo = _front_walls_needing_upgrade(turn, need_level)
-        # 迎敌正面（左右面）还有待升级：只对这些墙用券/走近
-        pool = front_todo or [
-            wall for wall in turn.walls()
-            if wall.level == need_level
-        ]
+        if front_below3:
+            pool = [wall for wall in front_below3 if wall.level == need_level]
+        else:
+            pool = [
+                wall for wall in turn.walls()
+                if wall.level == need_level
+            ]
         near = [
             wall for wall in pool
             if distance(role.pos, wall.pos) <= 1
@@ -1983,12 +2007,20 @@ def _wall_priority(turn: Turn, pos: Pos) -> int:
     return 2
 
 
-def _front_walls_needing_upgrade(turn: Turn, need_level: int) -> list[Unit]:
-    """迎敌正面（左右面）上仍待升级的墙。"""
+def _front_walls_below3(turn: Turn) -> list[Unit]:
+    """迎敌左右面尚未到 3 级的墙（正面固定 4 块）。"""
     front = _front_wall_cells(turn)
     return [
         wall for wall in turn.walls()
-        if wall.level == need_level and wall.pos in front
+        if wall.pos in front and wall.level < 3
+    ]
+
+
+def _front_walls_needing_upgrade(turn: Turn, need_level: int) -> list[Unit]:
+    """迎敌正面（左右面）上仍待升级的墙。"""
+    return [
+        wall for wall in _front_walls_below3(turn)
+        if wall.level == need_level
     ]
 
 
@@ -2000,23 +2032,35 @@ def _team_items(turn: Turn, name: str) -> int:
     return sum(role.item_count(name) for role in turn.controllable())
 
 
-def _wall_upgrades_owed(turn: Turn) -> int:
-    """先凑齐迎敌左右面升级券；正面升完后再补其余基本围墙。"""
+def _front_wall_upgrade_want(turn: Turn) -> tuple[str, int] | None:
+    """迎敌 4 块未到 3 级时，只买把它们送到 3 级的券。"""
     if not _wall_completion_phase(turn):
-        return 0
-    front = _front_wall_cells(turn)
-    front_todo = sum(
-        1 for wall in turn.walls()
-        if wall.level == 1 and wall.pos in front
-    )
-    if front_todo > 0:
-        return max(0, front_todo - _team_items(turn, WALL_UPGRADE_1))
+        return None
+    l1 = sum(1 for wall in _front_walls_below3(turn) if wall.level == 1)
+    l2 = sum(1 for wall in _front_walls_below3(turn) if wall.level == 2)
+    if l1:
+        owed = max(0, l1 - _team_items(turn, WALL_UPGRADE_1))
+        return (WALL_UPGRADE_1, owed) if owed else None
+    if l2:
+        owed = max(0, l2 - _team_items(turn, WALL_UPGRADE_2))
+        return (WALL_UPGRADE_2, owed) if owed else None
+    return None
+
+
+def _wall_upgrades_owed(turn: Turn) -> tuple[str, int] | None:
+    """先把迎敌左右面 4 块升到 3 级；正面完成后再补其余基本围墙的二级券。"""
+    front_want = _front_wall_upgrade_want(turn)
+    if front_want is not None:
+        return front_want
+    if not _wall_completion_phase(turn) or _front_walls_below3(turn):
+        return None
     basic = basic_wall_cells() or set(_wall_ring(turn))
     todo = sum(
         1 for wall in turn.walls()
         if wall.level == 1 and wall.pos in basic
     )
-    return max(0, todo - _team_items(turn, WALL_UPGRADE_1))
+    owed = max(0, todo - _team_items(turn, WALL_UPGRADE_1))
+    return (WALL_UPGRADE_1, owed) if owed else None
 
 
 def _fixer_owed(turn: Turn) -> bool:
@@ -2046,10 +2090,10 @@ def _buy_wall_supplies(
     ):
         return None
     want: tuple[str, int] | None = None
-    owed = min(_wall_upgrades_owed(turn), WALL_VOUCHER_BATCH)
-    # 建全阶段先买升级券；修复包只在没有待升墙时补。
-    if owed > 0:
-        want = (WALL_UPGRADE_1, owed)
+    owed = _wall_upgrades_owed(turn)
+    # 建全阶段先买升级券（迎敌 4 块优先买到能升 3 级）；修复包只在没有待升墙时补。
+    if owed is not None and owed[1] > 0:
+        want = (owed[0], min(owed[1], WALL_VOUCHER_BATCH))
     elif _fixer_owed(turn):
         damaged = sum(1 for wall in turn.walls() if _wall_damaged(wall))
         have = _team_items(turn, WALL_FIXER)
@@ -2279,7 +2323,8 @@ def _wanted_purchase(
     reserve = 0
     next_voucher = _next_weapon_voucher(turn)
     if next_voucher is not None and (
-        len(weapons) >= 3 and not _firepower_ready(turn)
+        _priority_weapon_goal_pending(turn)
+        or (len(weapons) >= 3 and not _firepower_ready(turn))
         or next_voucher == WEAPON_UPGRADE_2
     ):
         reserve = min(WEAPON_UPGRADE_RESERVE, turn.shop_price(next_voucher))
@@ -2302,7 +2347,7 @@ def _wanted_purchase(
         item = can_buy(next_voucher, core=True)
         if item:
             return item
-    # Day2 两座 L2、Day3 一座 L3 未完成前，所有钱只留给武器升级。
+    # Day1 一座 L2、Day2 三座 L2、Day3 一座 L3 未完成前，所有钱只留给武器升级。
     if _priority_weapon_goal_pending(turn):
         return None
     # 2) 基地保命升到 L2/L3
@@ -2320,13 +2365,18 @@ def _wanted_purchase(
         item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
-    # 3) 三级火箭后建全围墙，再买墙升级券
+    # 3) 三级火箭后建全围墙：迎敌 4 块先买到能升 3 级，再补其它墙
     if _wall_completion_phase(turn):
-        if any(wall.level == 1 for wall in walls):
+        front_want = _front_wall_upgrade_want(turn)
+        if front_want is not None:
+            item = can_buy(front_want[0])
+            if item:
+                return item
+        elif any(wall.level == 1 for wall in walls):
             item = can_buy(WALL_UPGRADE_1)
             if item:
                 return item
-        if any(wall.level == 2 for wall in walls):
+        elif any(wall.level == 2 for wall in walls):
             item = can_buy(WALL_UPGRADE_2)
             if item:
                 return item
