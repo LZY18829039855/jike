@@ -120,6 +120,8 @@ class Memory:
     wall_lane: dict[int, str] = field(default_factory=dict)
     # 开局石矿分工：unit -> 石矿坐标，避免两人挤同一处
     stone_mine: dict[int, Pos] = field(default_factory=dict)
+    # Day1 已采满一批（10 石）的工人：耗尽前只砌墙，不中途回矿
+    stone_batch_ready: set[int] = field(default_factory=set)
     # 采卖计划：unit -> (矿种, 目标数量)
     mine_quota: dict[int, tuple[str, int]] = field(default_factory=dict)
     # 本回合堵路待命，禁止再被 idle 支使去抖
@@ -173,6 +175,7 @@ def reset_memory() -> None:
     MEM.weapon_buyer_id = None
     MEM.wall_lane.clear()
     MEM.stone_mine.clear()
+    MEM.stone_batch_ready.clear()
     MEM.mine_quota.clear()
     MEM.idle_hold.clear()
     MEM.failed_steps.clear()

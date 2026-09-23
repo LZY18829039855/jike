@@ -278,6 +278,15 @@ def _rebuild_destroyed_walls(
     # 还没砌出过墙：走固定施工链，不要把「从未建过」当成被砸缺口从前墙开砌
     if not MEM.good_wall:
         return False
+    # Day1 采石批次未满时不要「有一块就砌」，继续采到 10
+    if turn.day_no <= 1 and _need_early_walls(turn):
+        if _day1_should_mine_stone(turn, role, sites):
+            return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+        if role.item_count(WALL_MATERIAL) > 0:
+            return _wall_work(
+                turn, role, sites, claimed, commands, hunt_stone=False,
+            )
+        return False
     # 有石头就去砌/贴缺口，不要改去挖别的矿；没石头才采石
     if role.item_count(WALL_MATERIAL) > 0:
         return _wall_work(
@@ -302,14 +311,26 @@ def _need_early_walls(turn: Turn) -> bool:
 def _day1_should_mine_stone(
     turn: Turn, role: Unit, walls_missing: list[Pos],
 ) -> bool:
-    """Day1：每人先采满 10 石再砌；石头用完或本链砌完后再去采下一批 10。"""
+    """Day1：每人采满 10 石再砌；石用完后再采下一批 10。
+
+    用 stone_batch_ready 区分「凑批次」与「耗批次」：
+    - 未满 10：一直采，不因有缺口就去砌；
+    - 满 10：标记就绪，开始砌；
+    - 石耗尽：清标记，再去采下一批。
+    """
+    del walls_missing
     if turn.day_no > 1 or not _need_early_walls(turn):
+        MEM.stone_batch_ready.discard(role.unit_id)
         return False
     stones = role.item_count(WALL_MATERIAL)
     if stones >= DAY1_STONE_PER_WORKER:
+        MEM.stone_batch_ready.add(role.unit_id)
         return False
-    # 包里还有石头且本链仍有缺口 → 继续砌，不中途回矿
-    if stones > 0 and walls_missing:
+    if stones == 0:
+        MEM.stone_batch_ready.discard(role.unit_id)
+        return True
+    # 0 < stones < 10：已就绪则继续砌，否则继续采满本批
+    if role.unit_id in MEM.stone_batch_ready:
         return False
     return True
 
@@ -2655,6 +2676,7 @@ def _ensure_day1_stone_mines(turn: Turn, workers: list[Unit]) -> None:
     """开局两工人各锁一处不同石矿；非 Day1 采石阶段则清空。"""
     if turn.day_no > 1 or not _need_early_walls(turn):
         MEM.stone_mine.clear()
+        MEM.stone_batch_ready.clear()
         return
     pair = sorted(
         (role for role in workers if role.kind == WORKER),
