@@ -1969,32 +1969,30 @@ def _stand_cells(
     return cells
 
 
-# 右下基地：以基地左下角格子为 (0,0)
-# 炮 (4,2)、(5,2)、(5,4)，角色站 (5,3) 同时贴住三座
-_SE_TOWER_LOCAL = ((4, 2), (5, 2), (5, 4))
-_SE_HUB_LOCAL = (5, 3)
-
-
 def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
-    """固定直角三炮：右下按左下角偏移；左上上下对称。"""
+    """三炮贴住基地一角，角色站缺口格同时贴住三座。
+
+    左上基地（左上角 sx,sy）：炮 (sx-1,sy-1)、(sx-1,sy+1)、(sx,sy+1)，站 (sx-1,sy)。
+    右下基地取中心对称。
+    """
     station = turn.station()
     if station is None:
         return ()
-    footprint = station_footprint(station.pos)
-    origin_x = min(pos.x for pos in footprint)
-    origin_y = min(pos.y for pos in footprint)
+    sx, sy = station.pos.x, station.pos.y
     if _base_is_northwest(turn):
-        # 以基地水平中线对称，炮群改到基地下方（朝地图中心）
-        towers = tuple(
-            Pos(origin_x + dx, origin_y + (1 - dy)) for dx, dy in _SE_TOWER_LOCAL
+        towers = (
+            Pos(sx - 1, sy - 1),
+            Pos(sx - 1, sy + 1),
+            Pos(sx, sy + 1),
         )
-        hx, hy = _SE_HUB_LOCAL
-        hub = Pos(origin_x + hx, origin_y + (1 - hy))
+        hub = Pos(sx - 1, sy)
     else:
-        towers = tuple(
-            Pos(origin_x + dx, origin_y + dy) for dx, dy in _SE_TOWER_LOCAL
+        towers = (
+            Pos(sx + 2, sy),
+            Pos(sx + 2, sy - 2),
+            Pos(sx + 1, sy - 2),
         )
-        hub = Pos(origin_x + _SE_HUB_LOCAL[0], origin_y + _SE_HUB_LOCAL[1])
+        hub = Pos(sx + 2, sy - 1)
     MEM.tower_plan = towers
     MEM.tower_hub = hub
     return towers
