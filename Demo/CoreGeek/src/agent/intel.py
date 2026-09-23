@@ -111,6 +111,10 @@ class Memory:
     move_hist: dict[int, list[Pos]] = field(default_factory=dict)
     # 采购在途：item -> (buyer_id, round)
     pending_buy: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # 武器升级券固定由一名工人采购，避免两人重复跑商店
+    weapon_buyer_id: int | None = None
+    # Day1 两名工人的围墙施工区：top / bottom
+    wall_lane: dict[int, str] = field(default_factory=dict)
     # 采卖计划：unit -> (矿种, 目标数量)
     mine_quota: dict[int, tuple[str, int]] = field(default_factory=dict)
     # 本回合堵路待命，禁止再被 idle 支使去抖
@@ -128,6 +132,8 @@ class Memory:
     threat_n: int = 0
     summon_day: int = 0
     summon_used: int = 0
+    # 最近一次买围墙修复包是第几天（每天至少买 1 个）
+    fixer_day: int = 0
     last_round: int = 0
     match_signature: tuple[Any, ...] = ()
 
@@ -152,6 +158,8 @@ def reset_memory() -> None:
     MEM.last_build.clear()
     MEM.move_hist.clear()
     MEM.pending_buy.clear()
+    MEM.weapon_buyer_id = None
+    MEM.wall_lane.clear()
     MEM.mine_quota.clear()
     MEM.idle_hold.clear()
     MEM.failed_steps.clear()
@@ -166,6 +174,7 @@ def reset_memory() -> None:
     MEM.threat_n = 0
     MEM.summon_day = 0
     MEM.summon_used = 0
+    MEM.fixer_day = 0
     MEM.pending_task_timeout = 0
     MEM.pending_task_pos = None
     MEM.pending_task_round = 0

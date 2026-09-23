@@ -152,16 +152,18 @@ def _day(
 
     workers = [role for role in turn.workers() if role.unit_id not in commands]
     mason_ids = _pick_mason_ids(turn, free_walls)
+    wall_lanes = _day1_wall_lanes(turn, workers, free_walls)
     # 临夜只需 1 人贴塔（与夜间单炮手一致），另一人继续挖矿
     night_gunner_id = _pick_day_gunner_id(turn, workers)
 
     for role in workers:
+        worker_walls = wall_lanes.get(role.unit_id, free_walls)
         budget = _worker_day(
             turn,
             role,
             sites,
             free_towers,
-            free_walls,
+            worker_walls,
             claimed,
             commands,
             budget,
@@ -173,8 +175,8 @@ def _day(
                 # Day1 墙未齐：囤石未满才采石，够了只砌墙
                 if _day1_stockpiling_stone(turn):
                     _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
-                elif free_walls and _wall_work(
-                    turn, role, free_walls, claimed, commands, hunt_stone=False,
+                elif worker_walls and _wall_work(
+                    turn, role, worker_walls, claimed, commands, hunt_stone=False,
                 ):
                     pass
                 elif (
@@ -268,6 +270,55 @@ def _pick_mason_ids(turn: Turn, walls_missing: list[Pos]) -> set[int]:
 
     ranked = sorted(workers, key=key)
     return {ranked[0].unit_id}
+
+
+def _day1_wall_lanes(
+    turn: Turn,
+    workers: list[Unit],
+    walls_missing: list[Pos],
+) -> dict[int, list[Pos]]:
+    """两名工人固定分守上下施工区，完成本区后才支援另一侧。"""
+    if turn.day_no > 1 or len(workers) < 2 or not walls_missing:
+        return {}
+    workers = sorted(workers[:2], key=lambda role: role.unit_id)
+    worker_ids = {role.unit_id for role in workers}
+    lanes_valid = (
+        set(MEM.wall_lane) == worker_ids
+        and set(MEM.wall_lane.values()) == {"top", "bottom"}
+    )
+    _front, top, bottom = _wall_build_plan(turn)
+    top_cells = set(top)
+    bottom_cells = set(bottom)
+    if not top_cells or not bottom_cells:
+        return {}
+
+    if not lanes_valid:
+        first, second = workers
+
+        def gap(role: Unit, cells: set[Pos]) -> int:
+            return min(distance(role.pos, pos) for pos in cells)
+
+        direct = gap(first, top_cells) + gap(second, bottom_cells)
+        swapped = gap(first, bottom_cells) + gap(second, top_cells)
+        if direct <= swapped:
+            MEM.wall_lane = {first.unit_id: "top", second.unit_id: "bottom"}
+        else:
+            MEM.wall_lane = {first.unit_id: "bottom", second.unit_id: "top"}
+
+    def lane_of(pos: Pos) -> str:
+        top_gap = min(distance(pos, cell) for cell in top_cells)
+        bottom_gap = min(distance(pos, cell) for cell in bottom_cells)
+        return "top" if top_gap <= bottom_gap else "bottom"
+
+    assigned: dict[int, list[Pos]] = {}
+    for role in workers:
+        lane = MEM.wall_lane[role.unit_id]
+        own = [pos for pos in walls_missing if lane_of(pos) == lane]
+        # 本区仍有缺口时禁止跨区；完成后再协助另一名工人。
+        assigned[role.unit_id] = own or [
+            pos for pos in walls_missing if lane_of(pos) != lane
+        ]
+    return assigned
 
 
 def _pick_day_gunner_id(turn: Turn, workers: list[Unit]) -> int | None:
@@ -383,6 +434,11 @@ def _worker_day(
     # Day1 墙已齐：改挖铁为主；升炮/购物仍可做
     day1_iron = turn.day_no <= 1 and not early_walls
 
+    # 第 2 天起：迎敌面和双炮边升二级，每天至少买 1 个修复包（排在武器券前）
+    spent = _buy_wall_supplies(turn, role, claimed, commands, budget)
+    if spent is not None:
+        return budget - spent
+
     if len(turn.weapons()) >= 3 and not fire_ready:
         if _prefer_weapon_upgrade(turn, role, budget):
             spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
@@ -457,12 +513,44 @@ def _next_weapon_voucher(turn: Turn) -> str | None:
     return None
 
 
+def _team_item_count(turn: Turn, name: str) -> int:
+    return sum(role.item_count(name) for role in turn.controllable())
+
+
+def _weapon_upgrade_buyer_id(turn: Turn) -> int | None:
+    """全局固定一名工人采购武器券；失效或火力满级后才重选。"""
+    if _next_weapon_voucher(turn) is None:
+        MEM.weapon_buyer_id = None
+        return None
+    workers = list(turn.workers())
+    if not workers:
+        MEM.weapon_buyer_id = None
+        return None
+    valid_ids = {role.unit_id for role in workers}
+    if MEM.weapon_buyer_id in valid_ids:
+        return MEM.weapon_buyer_id
+    shop = turn.shop_pos()
+    buyer = min(
+        workers,
+        key=lambda role: (
+            distance(role.pos, shop) if shop is not None else 99,
+            role.unit_id,
+        ),
+    )
+    MEM.weapon_buyer_id = buyer.unit_id
+    return buyer.unit_id
+
+
 def _prefer_weapon_upgrade(turn: Turn, role: Unit, budget: int) -> bool:
-    """有塔且金币够时，去买武器升级券。"""
+    """仅全局指定采购员去买券；队伍已有同类券时不重复购买。"""
+    if role.unit_id != _weapon_upgrade_buyer_id(turn):
+        return False
     if role.find_item(WEAPON_UPGRADE_1) or role.find_item(WEAPON_UPGRADE_2):
         return False
     name = _next_weapon_voucher(turn)
     if name is None:
+        return False
+    if _team_item_count(turn, name) > 0:
         return False
     return budget >= turn.shop_price(name)
 
@@ -474,8 +562,12 @@ def _buy_weapon_upgrade(
     commands: dict[int, dict[str, Any]],
     budget: int,
 ) -> int | None:
+    if role.unit_id != _weapon_upgrade_buyer_id(turn):
+        return None
     name = _next_weapon_voucher(turn)
     if name is None:
+        return None
+    if _team_item_count(turn, name) > 0:
         return None
     price = turn.shop_price(name)
     if budget < price:
@@ -1051,14 +1143,15 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     ):
         used_controllers.add(pioneer.unit_id)
     # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点；再否则当炮手
-    elif pioneer is not None and turn.phase_task.strip():
+    elif (
+        pioneer is not None
+        and turn.phase_task.strip()
+        and not should_abandon_task(turn)
+    ):
         prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
         submitted = (commands.get(pioneer.unit_id) or {}).get("action") == "submitAnswer"
         if submitted:
             used_controllers.add(pioneer.unit_id)
-        elif should_abandon_task(turn):
-            if _leave_task(turn, pioneer, claimed, commands):
-                used_controllers.add(pioneer.unit_id)
         else:
             _glue_to_task(turn, pioneer, claimed, commands)
             if pioneer.unit_id in commands or prompt or execute_cmd:
@@ -1078,7 +1171,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     # 三火箭 CD=3：有怪时只需 1 人轮流控三炮；清场后不再占炮
     gunner = None if cleared else _pick_night_gunner(turn, used_controllers)
     if gunner is not None and gunner.unit_id not in commands:
-        if _try_use_upgrade(turn, gunner, commands, claimed):
+        if _try_use_upgrade(turn, gunner, commands, claimed, walk_walls=False):
             used_controllers.add(gunner.unit_id)
         elif gunner.health <= 100:
             med = gunner.find_item(MEDICINE)
@@ -1093,6 +1186,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
 
     anchor = station.pos if station is not None else None
     gunner_id = gunner.unit_id if gunner is not None else None
+    night_budget = turn.gold
     for role in turn.controllable():
         if role.unit_id in commands or role.unit_id in used_controllers:
             continue
@@ -1105,6 +1199,8 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             continue
         # 有怪时唯一炮手冷却空窗只贴身采；清场后和其他人一样出工
         if role.unit_id == gunner_id:
+            if _fix_walls(turn, role, claimed, commands, walk=False):
+                continue
             at_tower = any(
                 distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
             )
@@ -1115,11 +1211,21 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             else:
                 _solo_rocket_fire(turn, role, claimed, commands)
             continue
+        # 围墙掉血就拿修复包去补；夜里寻路自带不越正面墙、不贴机器人
+        if _fix_walls(turn, role, claimed, commands):
+            continue
         if role.kind != WORKER:
             if role.ore_counts():
                 _sell_or_walk(turn, role, claimed, commands)
             elif cleared:
                 _buy_or_walk(turn, role, claimed, commands, turn.gold)
+            continue
+        # 工人夜里不守炮：有必要物品就采购，否则继续采矿。
+        spent = _buy_or_walk(
+            turn, role, claimed, commands, night_budget,
+        )
+        if spent is not None:
+            night_budget -= spent
             continue
         outside = not cleared and not _behind_robot_front(turn, role.pos)
         _fill_idle_mine(
@@ -1136,7 +1242,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
 def _pick_night_gunner(
     turn: Turn, exclude: set[int],
 ) -> Unit | None:
-    """选唯一炮手：优先已贴就绪炮，否则离炮群最近的角色。"""
+    """选唯一炮手：开拓者优先，工人只在开拓者忙碌时应急。"""
     roles = [
         role for role in turn.controllable() if role.unit_id not in exclude
     ]
@@ -1146,6 +1252,9 @@ def _pick_night_gunner(
     cap = NIGHT_ROCKET_GUNNERS
     if cap <= 0:
         return None
+    pioneer = next((role for role in roles if role.kind == "pioneer"), None)
+    if pioneer is not None:
+        return pioneer
 
     def score(role: Unit) -> tuple:
         ready_here = sum(
@@ -1154,11 +1263,9 @@ def _pick_night_gunner(
         )
         near_any = sum(1 for tower in towers if distance(role.pos, tower.pos) <= 1)
         nearest = min(distance(role.pos, tower.pos) for tower in towers)
-        # 工人优先当炮手，开拓者尽量留给任务/采矿
-        pioneer_penalty = 1 if role.kind == "pioneer" else 0
         # 墙外的人赶回炮位要穿过进攻路线，墙内有人时不选它
         outside = 0 if _behind_robot_front(turn, role.pos) else 1
-        return (outside, -ready_here, -near_any, nearest, pioneer_penalty, role.unit_id)
+        return (outside, -ready_here, -near_any, nearest, role.unit_id)
 
     return min(roles, key=score)
 
@@ -1435,6 +1542,8 @@ def _try_use_upgrade(
     role: Unit,
     commands: dict[int, dict[str, Any]],
     claimed: set[Pos] | None = None,
+    *,
+    walk_walls: bool = True,
 ) -> bool:
     claimed = claimed if claimed is not None else set()
     # 武器升级：两人分头去不同的塔，寻路互斥
@@ -1475,17 +1584,8 @@ def _try_use_upgrade(
                 return True
 
     # 残血墙修复 / 围墙升级
-    fixer = role.find_item(WALL_FIXER)
-    if fixer:
-        damaged = [
-            wall for wall in turn.walls()
-            if wall.health < _wall_max_hp(wall) * 4 // 5
-            and distance(role.pos, wall.pos) <= 1
-        ]
-        if damaged:
-            wall = min(damaged, key=lambda unit: unit.health)
-            commands[role.unit_id] = use_command(fixer, wall.pos)
-            return True
+    if _fix_walls(turn, role, claimed, commands, walk=walk_walls):
+        return True
 
     for voucher, need_level in (
         (WALL_UPGRADE_1, 1),
@@ -1499,12 +1599,26 @@ def _try_use_upgrade(
             if wall.level == need_level and distance(role.pos, wall.pos) <= 1
         ]
         if walls:
-            wall = min(walls, key=lambda unit: unit.health)
+            wall = min(
+                walls,
+                key=lambda unit: (_wall_priority(turn, unit.pos), unit.health),
+            )
             commands[role.unit_id] = use_command(item, wall.pos)
             return True
-        targets = [wall for wall in turn.walls() if wall.level == need_level]
-        if targets:
-            target = min(targets, key=lambda unit: distance(role.pos, unit.pos))
+        if not walk_walls:
+            continue
+        # 先升迎敌面，再升双炮边，最后其它
+        targets = sorted(
+            (
+                wall for wall in turn.walls()
+                if wall.level == need_level and wall.pos not in claimed
+            ),
+            key=lambda unit: (
+                _wall_priority(turn, unit.pos),
+                distance(role.pos, unit.pos),
+            ),
+        )
+        for target in targets:
             step = _step_toward(turn, role, target.pos, claimed)
             if step is not None:
                 claimed.add(target.pos)
@@ -1537,6 +1651,133 @@ def _pick_upgrade_tower(
 def _wall_max_hp(wall: Unit) -> int:
     # level1/2/3 分别 1000/1500/2000
     return 500 * (min(max(wall.level, 1), 3) + 1)
+
+
+WALL_UPGRADE_FROM_DAY = 2
+WALL_FIXER_FROM_DAY = 2
+WALL_VOUCHER_BATCH = 4
+WALL_DAMAGED_RATIO = 0.8
+
+
+def _wall_priority(turn: Turn, pos: Pos) -> int:
+    """0=迎敌面，1=靠双炮那条边，2=其它。"""
+    front, _top, _bottom, _rear = _wall_face_cells(turn)
+    if pos in set(front):
+        return 0
+    if pos in set(_weapon_side_wall(turn)):
+        return 1
+    return 2
+
+
+def _wall_damaged(wall: Unit) -> bool:
+    return wall.health < _wall_max_hp(wall) * WALL_DAMAGED_RATIO
+
+
+def _team_items(turn: Turn, name: str) -> int:
+    return sum(role.item_count(name) for role in turn.controllable())
+
+
+def _wall_upgrades_owed(turn: Turn) -> int:
+    """第 2 天起要升到二级的墙（迎敌面 + 双炮边）里，还差几张券没买。"""
+    if turn.day_no < WALL_UPGRADE_FROM_DAY:
+        return 0
+    todo = sum(
+        1 for wall in turn.walls()
+        if wall.level == 1 and _wall_priority(turn, wall.pos) <= 1
+    )
+    return max(0, todo - _team_items(turn, WALL_UPGRADE_1))
+
+
+def _fixer_owed(turn: Turn) -> bool:
+    """第 2 天起每天至少买 1 个修复包；有残墙且全队手里没有时也补。"""
+    if turn.day_no < WALL_FIXER_FROM_DAY:
+        return False
+    if MEM.fixer_day != turn.day_no:
+        return True
+    return _team_items(turn, WALL_FIXER) == 0 and any(
+        _wall_damaged(wall) for wall in turn.walls()
+    )
+
+
+def _buy_wall_supplies(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    budget: int,
+) -> int | None:
+    """白天去商店买墙券/修复包，返回花掉的金币；没有要买的返回 None。"""
+    shop = turn.shop_pos()
+    if shop is None or not turn.is_day:
+        return None
+    want: tuple[str, int] | None = None
+    if _fixer_owed(turn):
+        want = (WALL_FIXER, 1)
+    else:
+        owed = min(_wall_upgrades_owed(turn), WALL_VOUCHER_BATCH)
+        if owed > 0:
+            want = (WALL_UPGRADE_1, owed)
+    if want is None:
+        return None
+    name, num = want
+    if purchase_busy(name, role.unit_id, turn.round_no):
+        return None
+    price = turn.shop_price(name)
+    num = min(num, budget // price) if price > 0 else num
+    if num <= 0:
+        return None
+    if distance(role.pos, shop) <= 1:
+        commands[role.unit_id] = buy_command(name, num)
+        note_purchase(name, role.unit_id, turn.round_no)
+        if name == WALL_FIXER:
+            MEM.fixer_day = turn.day_no
+        return price * num
+    step = _step_toward(turn, role, shop, claimed)
+    if step is None:
+        return None
+    commands[role.unit_id] = move_command(step)
+    note_purchase(name, role.unit_id, turn.round_no)
+    return 0
+
+
+def _fix_walls(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    *,
+    walk: bool = True,
+) -> bool:
+    """手里有修复包：贴身有残墙就修；否则走到最该修的残墙旁（迎敌面优先）。"""
+    fixer = role.find_item(WALL_FIXER)
+    if not fixer:
+        return False
+    damaged = [wall for wall in turn.walls() if _wall_damaged(wall)]
+    if not damaged:
+        return False
+    near = [wall for wall in damaged if distance(role.pos, wall.pos) <= 1]
+    if near:
+        wall = min(near, key=lambda unit: unit.health)
+        commands[role.unit_id] = use_command(fixer, wall.pos)
+        return True
+    if not walk:
+        return False
+    for wall in sorted(
+        damaged,
+        key=lambda unit: (
+            _wall_priority(turn, unit.pos),
+            unit.health,
+            distance(role.pos, unit.pos),
+        ),
+    ):
+        if wall.pos in claimed:
+            continue
+        step = _step_toward(turn, role, wall.pos, claimed)
+        if step is not None:
+            claimed.add(wall.pos)
+            commands[role.unit_id] = move_command(step)
+            return True
+    return False
 
 
 def _should_sell(turn: Turn, role: Unit) -> bool:
@@ -1687,8 +1928,12 @@ def _wanted_purchase(
             return name, price
         return None
 
-    # 1) 有塔则火力升级最优先。两座已是二级时先买三级券。
-    if next_voucher is not None:
+    # 1) 有塔则火力升级最优先，但只允许全局指定采购员购买。
+    if (
+        next_voucher is not None
+        and role.unit_id == _weapon_upgrade_buyer_id(turn)
+        and _team_item_count(turn, next_voucher) == 0
+    ):
         item = can_buy(next_voucher, core=True)
         if item:
             return item
@@ -1701,8 +1946,12 @@ def _wanted_purchase(
         item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
-    # 3) 火力成形后再升级围墙
-    if _firepower_ready(turn) or len(weapons) < 3:
+    # 3) 第 2 天起或火力成形后升级围墙
+    if (
+        turn.day_no >= WALL_UPGRADE_FROM_DAY
+        or _firepower_ready(turn)
+        or len(weapons) < 3
+    ):
         if any(wall.level == 1 for wall in walls):
             item = can_buy(WALL_UPGRADE_1)
             if item:
