@@ -442,18 +442,29 @@ def _front_wall_cells(turn: Turn) -> set[Pos]:
     return set(front)
 
 
-def _prefer_weapon_upgrade(turn: Turn, role: Unit, budget: int) -> bool:
-    """有塔且金币够时，去买武器升级券。"""
+def _next_weapon_voucher(turn: Turn) -> str | None:
+    """下一张武器券。已有两座二级时先买三级券，不把第三座升成二级。"""
     weapons = turn.weapons()
     if not weapons:
-        return False
+        return None
+    level2 = sum(1 for tower in weapons if tower.level == 2)
+    if level2 >= 2:
+        return WEAPON_UPGRADE_2
+    if any(tower.level == 1 for tower in weapons):
+        return WEAPON_UPGRADE_1
+    if level2:
+        return WEAPON_UPGRADE_2
+    return None
+
+
+def _prefer_weapon_upgrade(turn: Turn, role: Unit, budget: int) -> bool:
+    """有塔且金币够时，去买武器升级券。"""
     if role.find_item(WEAPON_UPGRADE_1) or role.find_item(WEAPON_UPGRADE_2):
         return False
-    if any(tower.level == 1 for tower in weapons):
-        return budget >= turn.shop_price(WEAPON_UPGRADE_1)
-    if any(tower.level == 2 for tower in weapons):
-        return budget >= turn.shop_price(WEAPON_UPGRADE_2)
-    return False
+    name = _next_weapon_voucher(turn)
+    if name is None:
+        return False
+    return budget >= turn.shop_price(name)
 
 
 def _buy_weapon_upgrade(
@@ -463,12 +474,7 @@ def _buy_weapon_upgrade(
     commands: dict[int, dict[str, Any]],
     budget: int,
 ) -> int | None:
-    weapons = turn.weapons()
-    name = None
-    if any(tower.level == 1 for tower in weapons):
-        name = WEAPON_UPGRADE_1
-    elif any(tower.level == 2 for tower in weapons):
-        name = WEAPON_UPGRADE_2
+    name = _next_weapon_voucher(turn)
     if name is None:
         return None
     price = turn.shop_price(name)
@@ -929,6 +935,8 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     prompt = ""
     execute_cmd = ""
     pioneer = turn.pioneer()
+    # 本波怪清完后不要再钉在炮上发呆，全员去采矿、卖货、采购
+    cleared = not turn.hostile_robots()
 
     # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点；再否则当炮手
     if pioneer is not None and turn.phase_task.strip():
@@ -955,8 +963,8 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     else:
         prompt = _maybe_treasure_prompt(turn)
 
-    # 三火箭 CD=3：只需 1 人轮流控三炮；另外两人立刻采矿，不先贴塔
-    gunner = _pick_night_gunner(turn, used_controllers)
+    # 三火箭 CD=3：有怪时只需 1 人轮流控三炮；清场后不再占炮
+    gunner = None if cleared else _pick_night_gunner(turn, used_controllers)
     if gunner is not None and gunner.unit_id not in commands:
         if _try_use_upgrade(turn, gunner, commands, claimed):
             used_controllers.add(gunner.unit_id)
@@ -977,7 +985,7 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     for role in turn.controllable():
         if role.unit_id in commands or role.unit_id in used_controllers:
             continue
-        # 唯一炮手：冷却空窗只贴身采；其余角色直接挖铜/铁
+        # 有怪时唯一炮手冷却空窗只贴身采；清场后和其他人一样出工
         if role.unit_id == gunner_id:
             at_tower = any(
                 distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
@@ -989,13 +997,19 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             else:
                 _solo_rocket_fire(turn, role, claimed, commands)
             continue
+        if role.kind != WORKER:
+            if role.ore_counts():
+                _sell_or_walk(turn, role, claimed, commands)
+            elif cleared:
+                _buy_or_walk(turn, role, claimed, commands, turn.gold)
+            continue
         _fill_idle_mine(
             turn,
             role,
             claimed,
             commands,
-            stay_near=anchor,
-            max_dist=14 if turn.weapons() else 99,
+            stay_near=None if cleared else anchor,
+            max_dist=99 if cleared else (14 if turn.weapons() else 99),
         )
     return prompt, execute_cmd
 
@@ -1534,10 +1548,14 @@ def _wanted_purchase(
     weapons = turn.weapons()
     walls = turn.walls()
     station = turn.station()
-    # 三炮未升满二级时预留升级金，避免被墙券/炸弹花光
+    # 下一张武器券的钱先留住，避免被墙券/炸弹花光
     reserve = 0
-    if len(weapons) >= 3 and not _firepower_ready(turn):
-        reserve = min(WEAPON_UPGRADE_RESERVE, turn.shop_price(WEAPON_UPGRADE_1))
+    next_voucher = _next_weapon_voucher(turn)
+    if next_voucher is not None and (
+        len(weapons) >= 3 and not _firepower_ready(turn)
+        or next_voucher == WEAPON_UPGRADE_2
+    ):
+        reserve = min(WEAPON_UPGRADE_RESERVE, turn.shop_price(next_voucher))
 
     def can_buy(name: str, stack: int = 1, *, core: bool = False) -> tuple[str, int] | None:
         if purchase_busy(name, role.unit_id, turn.round_no):
@@ -1548,13 +1566,9 @@ def _wanted_purchase(
             return name, price
         return None
 
-    # 1) 有塔则火力升级最优先（每座 L1→L2 / L2→L3）
-    if any(tower.level == 1 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_1, core=True)
-        if item:
-            return item
-    if any(tower.level == 2 for tower in weapons):
-        item = can_buy(WEAPON_UPGRADE_2, core=True)
+    # 1) 有塔则火力升级最优先。两座已是二级时先买三级券。
+    if next_voucher is not None:
+        item = can_buy(next_voucher, core=True)
         if item:
             return item
     # 2) 基地保命升到 L2/L3
@@ -2176,24 +2190,37 @@ def _trim_side_walls(cells: list[Pos], northwest: bool, trim: int) -> list[Pos]:
     return ordered[:keep]
 
 
+def _weapon_side_wall(turn: Turn) -> list[Pos]:
+    """靠近两座火箭的那条边，固定砌满 6 格。"""
+    _front, top, bottom, _rear = _wall_face_cells(turn)
+    if _base_is_northwest(turn):
+        return list(top)
+    return list(bottom)
+
+
 def _wall_build_plan(turn: Turn) -> tuple[list[Pos], list[Pos], list[Pos]]:
     """实际要砌的格子。
 
     Day1：迎敌面 + 上下两面满长（约 4+6+6=16 格）。
-    其后：上下改为靠敌半段并按战况缩短。
+    其后：远离双炮的一侧缩短；靠近两座火箭的那条边始终砌满 6 格。
     """
     front, top, bottom, _rear = _wall_face_cells(turn)
     if turn.day_no <= 1:
         return front, list(top), list(bottom)
     nw = _base_is_northwest(turn)
     trim = _side_trim_count(turn)
-    top_h = _trim_side_walls(_half_toward_front(top, nw), nw, trim)
-    bottom_h = _trim_side_walls(_half_toward_front(bottom, nw), nw, trim)
-    return front, top_h, bottom_h
+    if nw:
+        far = _trim_side_walls(_half_toward_front(bottom, nw), nw, trim)
+        return front, list(top), far
+    far = _trim_side_walls(_half_toward_front(top, nw), nw, trim)
+    return front, far, list(bottom)
 
 
 def _weapon_keep_open(turn: Turn) -> set[Pos]:
-    """炮位、操炮格及其邻格不砌墙，留给角色走进去控炮。"""
+    """炮位、操炮格及其邻格不砌墙，留给角色走进去控炮。
+
+    靠近两座火箭的那条 6 格墙不让路，必须砌满。
+    """
     if not MEM.tower_plan:
         _tower_sites(turn)
     anchors: set[Pos] = set(MEM.tower_plan)
@@ -2204,6 +2231,8 @@ def _weapon_keep_open(turn: Turn) -> set[Pos]:
     open_cells = set(anchors)
     for pos in anchors:
         open_cells.update(_neighbours(pos))
+    for pos in _weapon_side_wall(turn):
+        open_cells.discard(pos)
     return open_cells
 
 
