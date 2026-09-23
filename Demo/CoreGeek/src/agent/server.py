@@ -8,66 +8,6 @@ from .brain import decide
 
 LOGGER = logging.getLogger(__name__)
 DECIDE_LOCK = threading.Lock()
-_LAST_LOGGED_TASK = ""
-
-
-def _clip(text: str, limit: int = 1200) -> str:
-    text = (text or "").replace("\r\n", "\n").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 20] + "\n...<truncated>...\n" + text[-20:]
-
-
-def _submitted_answers(decision: dict[str, Any]) -> list[tuple[Any, str]]:
-    answers: list[tuple[Any, str]] = []
-    role_map = decision.get("roleCommandMap") or {}
-    if not isinstance(role_map, dict):
-        return answers
-    for unit_id, command in role_map.items():
-        if not isinstance(command, dict):
-            continue
-        if command.get("action") != "submitAnswer":
-            continue
-        answer = str(command.get("taskAnswer") or "").strip()
-        if answer:
-            answers.append((unit_id, answer))
-    return answers
-
-
-def _log_task_debug(payload: dict[str, Any], decision: dict[str, Any]) -> None:
-    """把自进化题目全文与提交答案打进 stdout，便于策略复盘。"""
-    global _LAST_LOGGED_TASK
-    round_no = payload.get("roundNo")
-    phase = (payload.get("phaseTask") or "").strip()
-    last = (payload.get("lastCmdResult") or "").strip()
-    execute = (decision.get("executeCmd") or "").strip()
-    prompt = (decision.get("prompt") or "").strip()
-    answers = _submitted_answers(decision)
-    if not phase:
-        _LAST_LOGGED_TASK = ""
-    if not (phase or last or execute or prompt or answers):
-        return
-    if phase and phase != _LAST_LOGGED_TASK:
-        _LAST_LOGGED_TASK = phase
-        LOGGER.info(
-            "round %s 【自进化题目】\n%s",
-            round_no,
-            _clip(phase, 6000),
-        )
-    for unit_id, answer in answers:
-        LOGGER.info(
-            "round %s 【自进化答案】unit=%s\n%s",
-            round_no,
-            unit_id,
-            _clip(answer, 4000),
-        )
-    if last:
-        # 工程题重点：CHECK# / FIX# / TOKEN / FAIL
-        LOGGER.info("round %s sandbox %s", round_no, _clip(last, 1500))
-    if execute:
-        LOGGER.info("round %s exec %s", round_no, _clip(execute, 500))
-    if prompt:
-        LOGGER.info("round %s prompt_len=%s", round_no, len(prompt))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -92,10 +32,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload.get("roundNo"),
                 decision.get("roleCommandMap"),
             )
-            try:
-                _log_task_debug(payload, decision)
-            except Exception:
-                LOGGER.exception("task debug log failed")
             body = json.dumps(decision, ensure_ascii=False).encode("utf-8")
         except Exception:
             LOGGER.exception("decision failed")
