@@ -923,6 +923,7 @@ def _solve_task(
 
 
 def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
+    _tower_sites(turn)
     claimed: set[Pos] = set()
     used_controllers: set[int] = set()
     prompt = ""
@@ -1041,13 +1042,13 @@ def _solo_rocket_fire(
         return False
 
     hub = _gunner_hub(turn, towers, role)
-    # 先走到能同时贴住尽量多炮的格子，避免两炮之间来回跑
+    # 必须站上共用格本身。_step_toward 只会停在邻格，而且会把目标格标成禁入。
     if hub is not None and role.pos != hub:
-        claimed.add(hub)
-        step = _step_toward(turn, role, hub, claimed)
+        step = _step_onto(turn, role, hub, claimed)
         if step is not None:
             commands[role.unit_id] = move_command(step)
             return True
+        # 这一步进不去就原地打已经贴住的炮，不要改去绕邻格。
 
     ready_here = [
         tower for tower in towers
@@ -1069,8 +1070,8 @@ def _solo_rocket_fire(
         if _try_combat_item(turn, role, commands, relaxed=True):
             return True
 
-    # 已在枢纽或走不到：只有贴不到任何就绪炮时，才退回追单炮
-    if hub is not None and role.pos == hub:
+    # 共用格存在时不再改追单炮，避免在西侧邻格之间来回走。
+    if hub is not None:
         if _try_combat_item(turn, role, commands, relaxed=True):
             return True
         return False
@@ -1656,8 +1657,17 @@ def _man_tower(
     commands: dict[int, dict[str, Any]],
     prefer_inside: bool = False,
 ) -> bool:
-    towers = turn.weapons()
+    towers = list(turn.weapons())
     if not towers:
+        return False
+    hub = _gunner_hub(turn, towers, role)
+    if hub is not None and role.pos != hub:
+        step = _step_onto(turn, role, hub, claimed)
+        if step is not None:
+            commands[role.unit_id] = move_command(step)
+            return True
+        return False
+    if hub is not None and role.pos == hub:
         return False
     # 找空闲塔：周围没有其他可控角色
     occupied_stands: set[Pos] = set()
@@ -1831,6 +1841,25 @@ def _step_or_idle(
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+
+
+def _step_onto(
+    turn: Turn,
+    role: Unit,
+    target: Pos,
+    claimed: set[Pos],
+) -> Pos | None:
+    """走进目标格。不能走 _step_toward：那只会停在旁边，还会把目标格禁掉。"""
+    if role.pos == target:
+        return None
+    avoid = set(failed_cells(role.unit_id)) | set(oscillation_bans(role.unit_id)) | set(claimed)
+    avoid.discard(target)
+    step = next_step(turn, role, target, avoid)
+    if step is None or (step != target and step in avoid):
+        return None
+    claimed.add(step)
+    claimed.add(target)
+    return step
 
 
 def _step_toward(
@@ -2163,12 +2192,25 @@ def _wall_build_plan(turn: Turn) -> tuple[list[Pos], list[Pos], list[Pos]]:
     return front, top_h, bottom_h
 
 
-def _wall_ring(turn: Turn) -> tuple[Pos, ...]:
-    """来敌面 + 上下侧（Day1 满长，其后半墙），不含背面；炮位/操控格让路。"""
-    front, top, bottom = _wall_build_plan(turn)
-    reserved = set(MEM.tower_plan)
+def _weapon_keep_open(turn: Turn) -> set[Pos]:
+    """炮位、操炮格及其邻格不砌墙，留给角色走进去控炮。"""
+    if not MEM.tower_plan:
+        _tower_sites(turn)
+    anchors: set[Pos] = set(MEM.tower_plan)
     if MEM.tower_hub is not None:
-        reserved.add(MEM.tower_hub)
+        anchors.add(MEM.tower_hub)
+    for weapon in turn.weapons():
+        anchors.add(weapon.pos)
+    open_cells = set(anchors)
+    for pos in anchors:
+        open_cells.update(_neighbours(pos))
+    return open_cells
+
+
+def _wall_ring(turn: Turn) -> tuple[Pos, ...]:
+    """来敌面 + 上下侧（Day1 满长，其后半墙），不含背面；炮旁留出通行格。"""
+    front, top, bottom = _wall_build_plan(turn)
+    reserved = _weapon_keep_open(turn)
     seen: set[Pos] = set()
     out: list[Pos] = []
     for pos in (*front, *top, *bottom):
@@ -2213,9 +2255,10 @@ def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
 
     ring = _wall_ring(turn)
     seeds = wall_zone_seeds()
+    keep_open = _weapon_keep_open(turn)
     frontier = {
         pos for seed in seeds for pos in _neighbours(seed)
-        if turn.land(pos) and pos not in seeds
+        if turn.land(pos) and pos not in seeds and pos not in keep_open
     }
     banned = bad_build_cells()
     anchor = threat_anchor(turn)
@@ -2224,7 +2267,7 @@ def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
 
     filtered: list[Pos] = []
     for pos in {*ring, *frontier}:
-        if pos in banned:
+        if pos in banned or pos in keep_open:
             continue
         # 只收核心计划内格子，或紧贴核心、仍靠来敌侧的邻格（黄区试探）
         if pos in core:
