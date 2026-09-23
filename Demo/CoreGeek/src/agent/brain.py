@@ -170,14 +170,17 @@ def _day(
         )
         if role.unit_id not in commands:
             if _need_early_walls(turn):
-                # Day1 三面墙未齐：空档只采石/砌墙，绝不挖铜铁
+                # Day1 墙未齐：囤石未满才采石，够了只砌墙
                 if _day1_stockpiling_stone(turn):
                     _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
                 elif free_walls and _wall_work(
-                    turn, role, free_walls, claimed, commands,
+                    turn, role, free_walls, claimed, commands, hunt_stone=False,
                 ):
                     pass
-                else:
+                elif (
+                    _day1_stone_accounted(turn) < DAY1_STONE_GOAL
+                    and role.item_count(WALL_MATERIAL) == 0
+                ):
                     _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
             else:
                 _fill_idle_mine(
@@ -207,9 +210,20 @@ def _need_early_walls(turn: Turn) -> bool:
     return _day1_wall_progress(turn) < 0.95
 
 
+def _day1_stone_accounted(turn: Turn) -> int:
+    """背包里的石头 + 已经砌上的三面墙，避免砌掉后又把目标刷回 16。"""
+    ring = set(_wall_ring(turn))
+    built = sum(1 for unit in turn.walls() if unit.pos in ring)
+    return _team_stone(turn) + built
+
+
 def _day1_stockpiling_stone(turn: Turn) -> bool:
-    """Day1：队内石头未到约 16 块前，全员先采石囤货，暂不砌墙。"""
-    return _need_early_walls(turn) and _team_stone(turn) < DAY1_STONE_GOAL
+    """Day1：累计约 16 石（含已砌）之前先采石；够了就停，不再回矿补货。"""
+    if not _need_early_walls(turn):
+        return False
+    if _day1_stone_accounted(turn) >= DAY1_STONE_GOAL:
+        return False
+    return _team_stone(turn) < DAY1_STONE_GOAL
 
 
 def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
@@ -314,9 +328,10 @@ def _worker_day(
         if _man_tower(turn, role, claimed, commands):
             return budget
 
-    # 5) 凑满 3 座火箭。Day1 墙未齐时只在已经贴着炮位时建造，避免满图追炮闲逛
+    # 5) 凑满 3 座火箭。囤石阶段只在贴着炮位时建，囤够后走去固定炮位
     early_walls = _need_early_walls(turn)
-    if towers_missing and budget >= WEAPON_BUILD_COST:
+    stockpiling = _day1_stockpiling_stone(turn)
+    if towers_missing and budget >= WEAPON_BUILD_COST and not stockpiling:
         candidates = [
             (index, site) for index, site in enumerate(sites)
             if site in towers_missing and site not in claimed
@@ -326,7 +341,10 @@ def _worker_day(
                 item for item in candidates
                 if distance(role.pos, item[1]) <= 1 and role.pos != item[1]
             ]
-            if adjacent or not early_walls:
+            # 墙还没齐时：手里有石头先留着砌墙，没石头的人去建炮
+            if role.item_count(WALL_MATERIAL) > 0 and early_walls and not adjacent:
+                candidates = []
+            if candidates:
                 pool = adjacent or candidates
                 index, site = min(
                     pool,
@@ -343,18 +361,22 @@ def _worker_day(
                         return budget - WEAPON_BUILD_COST
                     return budget
 
-    # 5.5) Day1：先囤约 16 石 → 砌齐三面墙，不等三炮齐
+    # 5.5) Day1：先囤约 16 石 → 砌墙；累计够 16 后不再回矿
     fire_ready = _firepower_ready(turn)
     if early_walls:
-        if _day1_stockpiling_stone(turn):
+        if stockpiling:
             if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
                 return budget
             return budget
         if walls_missing and _wall_work(
-            turn, role, walls_missing, claimed, commands,
+            turn, role, walls_missing, claimed, commands, hunt_stone=False,
         ):
             return budget
-        if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
+        if (
+            _day1_stone_accounted(turn) < DAY1_STONE_GOAL
+            and role.item_count(WALL_MATERIAL) == 0
+            and _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+        ):
             return budget
         return budget
 
@@ -523,7 +545,8 @@ def _wall_work(
 
     stones = role.item_count(WALL_MATERIAL)
     mine = _adjacent_mine(turn, role, WALL_MATERIAL)
-    stock_to = STONE_BATCH
+    # Day1 累计够 16 后，旁边有矿也不再补采，有石头就去砌
+    stock_to = 0 if turn.day_no <= 1 else STONE_BATCH
     if mine is not None and stones < stock_to:
         commands[role.unit_id] = collect_command(mine)
         claimed.add(mine)
