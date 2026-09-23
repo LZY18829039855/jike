@@ -185,8 +185,8 @@ def _day(
             if _rebuild_destroyed_walls(turn, role, claimed, commands):
                 continue
             if _need_early_walls(turn):
-                # Day1 墙未齐：囤石未满才采石，够了只砌墙
-                if _day1_stockpiling_stone(turn):
+                # Day1：每人先采满 10 石再按自己的链砌；石用完再去采下一批。
+                if _day1_should_mine_stone(turn, role, worker_walls):
                     _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
                 elif worker_walls and _wall_work(
                     turn, role, worker_walls, claimed, commands, hunt_stone=False,
@@ -199,15 +199,8 @@ def _day(
                         turn, role, free_walls, claimed, commands, hunt_stone=False,
                     )
                 ):
-                    # 本区剩余墙位暂时不可达时，立即跨区支援，不能困在墙内空转。
                     pass
-                elif (
-                    _day1_stone_accounted(turn) < DAY1_STONE_GOAL
-                    and role.item_count(WALL_MATERIAL) == 0
-                ):
-                    _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
                 else:
-                    # 无可施工墙位时改采高价值矿，不原地待命。
                     _fill_idle_mine(turn, role, claimed, commands)
             else:
                 _fill_idle_mine(
@@ -278,7 +271,7 @@ def _rebuild_destroyed_walls(
         return False
     if role.kind != WORKER:
         return False
-    sites = _basic_wall_gaps(turn)
+    sites = [pos for pos in _basic_wall_gaps(turn) if pos in MEM.good_wall]
     if not sites:
         return False
     # 还没砌出过墙：走固定施工链，不要把「从未建过」当成被砸缺口从前墙开砌
@@ -377,7 +370,7 @@ def _day1_wall_lanes(
     workers: list[Unit],
     walls_missing: list[Pos],
 ) -> dict[int, list[Pos]]:
-    """两名工人固定从上/下边最外侧开工，沿圈砌到迎敌左右面碰头。"""
+    """Day1：离上墙近的人走上链，离下墙近的人走下链。其后仍按双链分工。"""
     if len(workers) < 2 or not walls_missing:
         return {}
     if (
@@ -392,16 +385,22 @@ def _day1_wall_lanes(
         set(MEM.wall_lane) == worker_ids
         and set(MEM.wall_lane.values()) == {"top", "bottom"}
     )
-    top_chain, bottom_chain = _mason_chains(turn)
+    if turn.day_no <= 1:
+        top_chain, bottom_chain = _day1_mason_chains(turn)
+    else:
+        top_chain, bottom_chain = _mason_chains(turn)
     if not top_chain or not bottom_chain:
         return {}
 
     if not lanes_valid:
         first, second = workers
-        top_stand = _preferred_wall_stand(turn, top_chain[0]) or top_chain[0]
-        bottom_stand = _preferred_wall_stand(turn, bottom_chain[0]) or bottom_chain[0]
-        direct = distance(first.pos, top_stand) + distance(second.pos, bottom_stand)
-        swapped = distance(first.pos, bottom_stand) + distance(second.pos, top_stand)
+
+        def near(role: Unit, chain: list[Pos]) -> int:
+            side = chain[:-3] if len(chain) > 3 else chain
+            return min(distance(role.pos, pos) for pos in side)
+
+        direct = near(first, top_chain) + near(second, bottom_chain)
+        swapped = near(first, bottom_chain) + near(second, top_chain)
         if direct <= swapped:
             MEM.wall_lane = {first.unit_id: "top", second.unit_id: "bottom"}
         else:
@@ -488,10 +487,17 @@ def _worker_day(
         if _man_tower(turn, role, claimed, commands):
             return budget
 
-    # 5) 凑满 3 座火箭。囤石阶段只在贴着炮位时建，囤够后走去固定炮位
+    # 5) 凑满 3 座火箭。Day1 采石或手里有石砌墙时不改去建炮
     early_walls = _need_early_walls(turn)
-    stockpiling = _day1_stockpiling_stone(turn)
-    if towers_missing and budget >= WEAPON_BUILD_COST and not stockpiling:
+    mining_stone = early_walls and _day1_should_mine_stone(
+        turn, role, walls_missing,
+    )
+    if (
+        towers_missing
+        and budget >= WEAPON_BUILD_COST
+        and not mining_stone
+        and not (early_walls and role.item_count(WALL_MATERIAL) > 0)
+    ):
         candidates = [
             (index, site) for index, site in enumerate(sites)
             if site in towers_missing and site not in claimed
@@ -521,26 +527,19 @@ def _worker_day(
                         return budget - WEAPON_BUILD_COST
                     return budget
 
-    # 5.5) Day1：先囤约 16 石 → 砌墙；累计够 16 后不再回矿
+    # 5.5) Day1：每人先采满 10 石，再按自己的链砌；石用完再采下一批
     fire_ready = _firepower_ready(turn)
     if early_walls:
-        if stockpiling:
+        if mining_stone:
             if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
                 return budget
             return budget
-        # 第一天墙未齐也要抽出买 1 张二级券，避免拖到第二天
-        if turn.weapons() and _prefer_weapon_upgrade(turn, role, budget):
-            spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
-            if spent is not None:
-                return budget - spent
         if walls_missing and _wall_work(
             turn, role, walls_missing, claimed, commands, hunt_stone=False,
         ):
             return budget
-        if (
-            _day1_stone_accounted(turn) < DAY1_STONE_GOAL
-            and role.item_count(WALL_MATERIAL) == 0
-            and _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+        if _day1_should_mine_stone(turn, role, walls_missing) and _mine_kind(
+            turn, role, WALL_MATERIAL, claimed, commands,
         ):
             return budget
         return budget
@@ -833,13 +832,13 @@ def _wall_work(
     commands: dict[int, dict[str, Any]],
     hunt_stone: bool = True,
 ) -> bool:
-    # Day1 囤石阶段：只采不砌，凑够约 16 块再统一建墙
-    if _day1_stockpiling_stone(turn):
+    # Day1：没凑满本批 10 石、或本链石已用完时去采石，不中途改砌
+    if _day1_should_mine_stone(turn, role, walls_missing):
         return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
 
     stones = role.item_count(WALL_MATERIAL)
     mine = _adjacent_mine(turn, role, WALL_MATERIAL)
-    # Day1 累计够 16 后，旁边有矿也不再补采，有石头就去砌
+    # Day1 手里有石就按链砌，旁边有矿也不回头补采
     stock_to = 0 if turn.day_no <= 1 else STONE_BATCH
     if mine is not None and stones < stock_to:
         commands[role.unit_id] = collect_command(mine)
@@ -3016,24 +3015,50 @@ def _preferred_wall_stand(turn: Turn, wall: Pos) -> Pos | None:
     return stand
 
 
-def _mason_chains(turn: Turn) -> tuple[list[Pos], list[Pos]]:
-    """写死施工链：上边最外侧 → 迎敌左右面；下边最外侧 → 迎敌左右面，中间碰头。"""
-    front, top, bottom = _wall_build_plan(turn)
+def _clean_wall_cells(turn: Turn, cells: list[Pos]) -> list[Pos]:
     reserved = _weapon_keep_open(turn)
     banned = bad_build_cells()
-    nw = _base_is_northwest(turn)
+    standing = {wall.pos for wall in turn.walls()}
+    seen: set[Pos] = set()
+    out: list[Pos] = []
+    for pos in cells:
+        if pos in seen or pos in reserved or pos in banned:
+            continue
+        # 已经砌上的墙不再是空地，但仍属于施工链，否则进度会被算成 0
+        if not turn.land(pos) and pos not in standing:
+            continue
+        seen.add(pos)
+        out.append(pos)
+    return out
 
-    def clean(cells: list[Pos]) -> list[Pos]:
-        seen: set[Pos] = set()
-        out: list[Pos] = []
-        for pos in cells:
-            if pos in seen or pos in reserved or pos in banned:
-                continue
-            if not turn.land(pos):
-                continue
-            seen.add(pos)
-            out.append(pos)
-        return out
+
+def _day1_mason_chains(turn: Turn) -> tuple[list[Pos], list[Pos]]:
+    """Day1 双链。
+
+    右下基地：从上/下边的右端（背面）向左砌到左端，再沿左墙各拐 3 格。
+    左上基地对称：从左端向右砌到右端，再沿右墙各拐 3 格。
+    """
+    front, top, bottom, _rear = _wall_face_cells(turn)
+    if not front and not top and not bottom:
+        return [], []
+    if _base_is_northwest(turn):
+        top_arm = sorted(top, key=lambda pos: pos.x)
+        bottom_arm = sorted(bottom, key=lambda pos: pos.x)
+    else:
+        top_arm = sorted(top, key=lambda pos: -pos.x)
+        bottom_arm = sorted(bottom, key=lambda pos: -pos.x)
+    down = sorted(front, key=lambda pos: -pos.y)[:3]
+    up = sorted(front, key=lambda pos: pos.y)[:3]
+    return (
+        _clean_wall_cells(turn, [*top_arm, *down]),
+        _clean_wall_cells(turn, [*bottom_arm, *up]),
+    )
+
+
+def _mason_chains(turn: Turn) -> tuple[list[Pos], list[Pos]]:
+    """其后施工链：上边最外侧 → 迎敌面；下边最外侧 → 迎敌面，中间碰头。"""
+    front, top, bottom = _wall_build_plan(turn)
+    nw = _base_is_northwest(turn)
 
     if nw:
         top_arm = sorted(top, key=lambda pos: (pos.x, pos.y))
@@ -3047,7 +3072,10 @@ def _mason_chains(turn: Turn) -> tuple[list[Pos], list[Pos]]:
     mid = (len(front_down) + 1) // 2
     top_front = front_down[:mid]
     bottom_front = list(reversed(front_down[mid:]))
-    return clean([*top_arm, *top_front]), clean([*bottom_arm, *bottom_front])
+    return (
+        _clean_wall_cells(turn, [*top_arm, *top_front]),
+        _clean_wall_cells(turn, [*bottom_arm, *bottom_front]),
+    )
 
 
 def _is_outside_wall_stand(turn: Turn, stand: Pos, wall: Pos) -> bool:
@@ -3289,7 +3317,9 @@ def _weapon_keep_open(turn: Turn) -> set[Pos]:
 
 
 def _wall_ring(turn: Turn) -> tuple[Pos, ...]:
-    """来敌面 + 上下侧（Day1 满长，其后半墙），不含背面；炮旁留出通行格。"""
+    """Day1 用双链目标；其后仍是来敌面 + 上下侧，炮旁留通行格。"""
+    if turn.day_no <= 1:
+        return _full_wall_ring(turn)
     front, top, bottom = _wall_build_plan(turn)
     reserved = _weapon_keep_open(turn)
     seen: set[Pos] = set()
@@ -3320,12 +3350,15 @@ def _gate_cell(turn: Turn) -> Pos | None:
 
 
 def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
-    """建造顺序：上边最外侧、下边最外侧各一条链，砌到迎敌左右面碰头。"""
+    """建造顺序。Day1 按背面角落向迎敌面各拐 3 格；其后双链碰头。"""
     del seal
     if turn.station() is None:
         return ()
-    top_chain, bottom_chain = _mason_chains(turn)
-    return tuple(dict.fromkeys([*top_chain, *bottom_chain]))[:20]
+    if turn.day_no <= 1:
+        top_chain, bottom_chain = _day1_mason_chains(turn)
+    else:
+        top_chain, bottom_chain = _mason_chains(turn)
+    return tuple(dict.fromkeys([*top_chain, *bottom_chain]))[:24]
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:
