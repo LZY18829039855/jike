@@ -15,12 +15,15 @@ from .protocol import (
     Turn,
     WALL_MATERIAL,
     distance,
+    station_footprint,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 LLM_DAILY_LIMIT = 3
 DEFAULT_ORE_PRICE = {WALL_MATERIAL: 1, IRON: 3, COPPER: 5}
+# 相对基地占地的切比雪夫距离；第一天附近无铁则改采铜
+NEAR_BASE_MINE_DIST = 15
 
 # 本图民间传闻已锁定：不解析传闻，按写死流程备祭品并第 8 天白天召唤。
 FIXED_TREASURE_DAY = 8
@@ -124,6 +127,8 @@ class Memory:
     build_failures: dict[Pos, int] = field(default_factory=dict)
     good_wall: set[Pos] = field(default_factory=set)
     good_weapon: set[Pos] = field(default_factory=set)
+    # 第一天砌出的基本围墙坐标；之后被砸成空地必须优先补回
+    basic_wall: set[Pos] = field(default_factory=set)
     # 开局选定的直角三炮位（含共用操控格），避免反复换点导致无法一格贴三炮
     tower_plan: tuple[Pos, ...] = ()
     tower_hub: Pos | None = None
@@ -132,8 +137,10 @@ class Memory:
     threat_n: int = 0
     summon_day: int = 0
     summon_used: int = 0
-    # 最近一次买围墙修复包是第几天（每天至少买 1 个）
+    # 最近一次买围墙修复包是第几天
     fixer_day: int = 0
+    # 用券/修墙时锁定目标格，避免两座墙之间来回换
+    use_target: dict[int, Pos] = field(default_factory=dict)
     # 上回合的 use 指令与 (物品, 目标格) 的累计失败次数，避免同一张券原地狂刷
     last_use: dict[int, tuple[str, Pos]] = field(default_factory=dict)
     use_failures: dict[tuple[str, Pos], int] = field(default_factory=dict)
@@ -170,6 +177,7 @@ def reset_memory() -> None:
     MEM.build_failures.clear()
     MEM.good_wall.clear()
     MEM.good_weapon.clear()
+    MEM.basic_wall.clear()
     MEM.tower_plan = ()
     MEM.tower_hub = None
     MEM.threat_x = 0
@@ -178,6 +186,7 @@ def reset_memory() -> None:
     MEM.summon_day = 0
     MEM.summon_used = 0
     MEM.fixer_day = 0
+    MEM.use_target.clear()
     MEM.last_use.clear()
     MEM.use_failures.clear()
     MEM.pending_task_timeout = 0
@@ -198,6 +207,7 @@ def observe(turn: Turn) -> None:
     _ensure_match(turn)
     MEM.idle_hold.clear()
     _clear_stale_purchases(turn)
+    _clear_stale_use_targets(turn)
 
     if MEM.llm_day != turn.day_no:
         MEM.llm_day = turn.day_no
@@ -394,6 +404,34 @@ def _clear_stale_purchases(turn: Turn) -> None:
             MEM.pending_buy.pop(name, None)
 
 
+_USE_LOCK_ITEMS = (
+    "WallFixer",
+    "WallUpgradeVoucher1",
+    "WallUpgradeVoucher2",
+    "WeaponUpgradeVoucher1",
+    "WeaponUpgradeVoucher2",
+    "StationUpgradeVoucher1",
+    "StationUpgradeVoucher2",
+)
+
+
+def _clear_stale_use_targets(turn: Turn) -> None:
+    """手里没券/目标建筑消失时松开锁定格。"""
+    by_id = {unit.unit_id: unit for unit in turn.controllable()}
+    standing = {unit.pos for unit in turn.walls()}
+    standing.update(unit.pos for unit in turn.weapons())
+    station = turn.station()
+    if station is not None:
+        standing.update(station_footprint(station.pos))
+    for unit_id, pos in list(MEM.use_target.items()):
+        role = by_id.get(unit_id)
+        if role is None or not any(role.has_item(name) for name in _USE_LOCK_ITEMS):
+            MEM.use_target.pop(unit_id, None)
+            continue
+        if pos not in standing:
+            MEM.use_target.pop(unit_id, None)
+
+
 def purchase_busy(name: str, unit_id: int, round_no: int) -> bool:
     """其它角色已在买同款商品。"""
     entry = MEM.pending_buy.get(name)
@@ -438,6 +476,14 @@ def _observe_zones(turn: Turn) -> None:
 
 def wall_zone_seeds() -> frozenset[Pos]:
     return frozenset(MEM.good_wall)
+
+
+def basic_wall_cells() -> frozenset[Pos]:
+    return frozenset(MEM.basic_wall)
+
+
+def note_basic_wall(cells: set[Pos] | frozenset[Pos]) -> None:
+    MEM.basic_wall.update(cells)
 
 
 def weapon_zone_seeds() -> frozenset[Pos]:
@@ -697,9 +743,31 @@ def dump_ore(turn: Turn, ore: str) -> bool:
     return price > DEFAULT_ORE_PRICE.get(ore, price)
 
 
+def ore_near_station(turn: Turn, ore: str, radius: int = NEAR_BASE_MINE_DIST) -> bool:
+    """基地附近是否有指定矿种。"""
+    mines = turn.mines(ore)
+    if not mines:
+        return False
+    station = turn.station()
+    if station is None:
+        return True
+    footprint = station_footprint(station.pos)
+    return any(
+        min(distance(pos, cell) for cell in footprint) <= radius
+        for pos in mines
+    )
+
+
+def prefer_day1_copper(turn: Turn) -> bool:
+    """第一天基地附近没有铁矿时，优先采铜，避免空跑远处铁。"""
+    return turn.day_no == 1 and not ore_near_station(turn, IRON)
+
+
 def upcoming_hot_ore(turn: Turn) -> str | None:
-    # Day1–2：全力囤铁；之后铜价优先，不再把铁当热点
+    # Day1：附近无铁则不把铁当热点；Day2 仍囤铁；之后铜价优先
     if turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+        if prefer_day1_copper(turn):
+            return COPPER
         return IRON
     soon: list[MarketEvent] = []
     for event in MEM.events:
@@ -714,14 +782,15 @@ def upcoming_hot_ore(turn: Turn) -> str | None:
 
 
 def mine_rank(turn: Turn, keep_stone: bool) -> list[str]:
-    """写死行情：Day1–2 铁优先；Day3–4 铁停采；Day5+ 铜优先于铁。"""
+    """写死行情：Day1–2 铁优先（Day1 附近无铁则铜优先）；Day3–4 铁停采；Day5+ 铜优先。"""
     hot = upcoming_hot_ore(turn)
+    copper_first = prefer_day1_copper(turn)
     scored: list[tuple[int, int, str]] = []
     for ore in (COPPER, IRON, WALL_MATERIAL):
         if mine_blocked(turn, ore):
             continue
-        # 基础档：铜 > 铁 > 石；囤铁期铁压过铜
-        if turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+        # 基础档：铜 > 铁 > 石；囤铁期铁压过铜；Day1 附近无铁则铜压过铁
+        if turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL and not copper_first:
             tier = 4 if ore == IRON else 3 if ore == COPPER else 0
         else:
             tier = 3 if ore == COPPER else 2 if ore == IRON else 0

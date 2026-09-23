@@ -14,6 +14,7 @@ from .intel import (
     FIXED_RITUAL_BUY_FROM_DAY,
     FIXED_IRON_STOCKPILE_UNTIL,
     bad_build_cells,
+    basic_wall_cells,
     dump_ore,
     failed_cells,
     hold_idle,
@@ -22,10 +23,12 @@ from .intel import (
     mine_rank,
     missing_ritual,
     need_ritual_prep,
+    note_basic_wall,
     note_purchase,
     note_summon_used,
     observe,
     oscillation_bans,
+    prefer_day1_copper,
     purchase_busy,
     remember_commands,
     remember_task_accept,
@@ -110,6 +113,7 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         prompt, execute_cmd = _night(turn, commands)
     _dedupe_role_commands(turn, commands)
+    _refill_idle_roles(turn, commands)
     remember_commands(commands)
     return {
         "roleCommandMap": {
@@ -125,6 +129,7 @@ def _day(
     turn: Turn, commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
     sites = _tower_sites(turn)
+    _lock_basic_wall(turn)
     order = _wall_order(turn, seal=_should_seal(turn))
     standing_towers = {unit.pos for unit in turn.weapons()}
     standing_walls = {unit.pos for unit in turn.walls()}
@@ -136,7 +141,11 @@ def _day(
         towers_missing = [
             pos for pos in sites if pos not in standing_towers
         ][: 3 - len(standing_towers)]
-    walls_missing = [pos for pos in order if pos not in standing_walls]
+    # 基本围墙缺口永远排在白天施工最前，确保每天优先保全
+    basic_gaps = _basic_wall_gaps(turn)
+    walls_missing = list(dict.fromkeys(
+        [*basic_gaps, *[pos for pos in order if pos not in standing_walls]],
+    ))
     banned = bad_build_cells()
     free_towers = [
         pos for pos in towers_missing if pos not in occupied and pos not in banned
@@ -215,16 +224,47 @@ def _team_stone(turn: Turn) -> int:
 
 
 def _destroyed_wall_sites(turn: Turn) -> list[Pos]:
-    """曾建成、现已消失的墙位，视为需要立即重建的缺口。
+    """基本围墙缺口：第一天锁定的墙位变空地后必须补回。"""
+    return _basic_wall_gaps(turn)
 
-    不限于当天缩短后的计划圈：第一天砌满、夜里被砸掉的格子也要补上。
-    炮位/操炮通道不重建，避免把人封在墙外。
-    """
+
+def _full_wall_ring(turn: Turn) -> tuple[Pos, ...]:
+    """第一天规格的三面满墙（迎敌面 + 上下满长），炮旁留通行格。"""
+    front, top, bottom, _rear = _wall_face_cells(turn)
+    reserved = _weapon_keep_open(turn)
+    seen: set[Pos] = set()
+    out: list[Pos] = []
+    for pos in (*front, *top, *bottom):
+        if pos in seen or not turn.land(pos) or pos in reserved:
+            continue
+        seen.add(pos)
+        out.append(pos)
+    return tuple(out)
+
+
+def _lock_basic_wall(turn: Turn) -> None:
+    """第一天把满墙计划锁定为基本围墙；之后只增不改。"""
+    if turn.day_no == 1:
+        note_basic_wall(set(_full_wall_ring(turn)))
+        note_basic_wall({wall.pos for wall in turn.walls()})
+        return
+    if not basic_wall_cells():
+        # 中途重启记忆时，用满墙规格 + 曾站住的墙位回填
+        note_basic_wall(set(_full_wall_ring(turn)))
+        note_basic_wall(set(wall_zone_seeds()))
+
+
+def _basic_wall_gaps(turn: Turn) -> list[Pos]:
+    """基本围墙位上当前没有墙的格子，白天优先补齐。"""
+    _lock_basic_wall(turn)
+    basic = basic_wall_cells()
+    if not basic:
+        return []
     standing = {wall.pos for wall in turn.walls()}
     reserved = _weapon_keep_open(turn)
     return sorted(
         (
-            pos for pos in wall_zone_seeds()
+            pos for pos in basic
             if pos not in standing
             and pos not in reserved
             and pos not in bad_build_cells()
@@ -240,19 +280,18 @@ def _rebuild_destroyed_walls(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """围墙被打烂后立刻新建：有石头去砌，没石头去采，不插队卖矿/升炮/购物。"""
+    """基本围墙变空地后立刻新建：有石头去砌，没石头去采。"""
     if role.kind != WORKER:
         return False
-    sites = _destroyed_wall_sites(turn)
+    sites = _basic_wall_gaps(turn)
     if not sites:
         return False
     if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
         turn, role, sites, claimed, commands, hunt_stone=False,
     ):
         return True
-    if role.item_count(WALL_MATERIAL) == 0:
-        return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
-    return False
+    # 全队缺墙时人人去采石补缺口，不要求自己包里已有石头
+    return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
 
 
 def _day1_wall_progress(turn: Turn) -> float:
@@ -285,7 +324,9 @@ def _day1_stockpiling_stone(turn: Turn) -> bool:
 
 
 def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
-    """三面墙基本齐、且不临夜缺墙时，视为围墙无风险。"""
+    """基本围墙完整、且不临夜缺墙时，视为围墙无风险。"""
+    if _basic_wall_gaps(turn):
+        return False
     if not walls_missing:
         return True
     if _wall_completion_phase(turn) and walls_missing:
@@ -302,11 +343,11 @@ def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
 
 
 def _pick_mason_ids(turn: Turn, walls_missing: list[Pos]) -> set[int]:
-    """Day1 三面墙未齐：全员石匠；墙稳后最多留 1 人补石砌墙。"""
+    """基本围墙有缺口或 Day1 未齐：全员石匠；墙稳后最多留 1 人补石砌墙。"""
     workers = list(turn.workers())
     if not workers:
         return set()
-    if _destroyed_wall_sites(turn):
+    if _basic_wall_gaps(turn):
         return {role.unit_id for role in workers}
     if _wall_completion_phase(turn) and walls_missing:
         return {role.unit_id for role in workers}
@@ -507,10 +548,11 @@ def _worker_day(
     # Day1 墙已齐：改挖铁为主；升炮/购物仍可做
     day1_iron = turn.day_no <= 1 and not early_walls
 
-    # 核心火力阶段目标完成后，再买迎敌面墙券和修复包。
-    spent = _buy_wall_supplies(turn, role, claimed, commands, budget)
-    if spent is not None:
-        return budget - spent
+    # 手里还有未用券/修复包，或采矿批次未满：先做完，不去商店。
+    if not _should_defer_shop(turn, role):
+        spent = _buy_wall_supplies(turn, role, claimed, commands, budget)
+        if spent is not None:
+            return budget - spent
 
     if len(turn.weapons()) >= 3 and not fire_ready:
         if _prefer_weapon_upgrade(turn, role, budget):
@@ -542,9 +584,10 @@ def _worker_day(
         return budget
 
     # 8) 买武器升级券等；买完由步骤 2 在后续回合使用
-    spent = _buy_or_walk(turn, role, claimed, commands, budget)
-    if spent is not None:
-        return budget - spent
+    if not _should_defer_shop(turn, role):
+        spent = _buy_or_walk(turn, role, claimed, commands, budget)
+        if spent is not None:
+            return budget - spent
 
     # 9) 经济采集：Day1 墙齐后铁优先；石匠在仍需墙时才掺石头
     keep_stone = (
@@ -846,12 +889,13 @@ def _pioneer_day(
 
     if turn.day_no in PIONEER_TASK_DAYS:
         if should_prioritize(turn):
+            # 只有就绪任务才贴点；冷却中不空走任务点，去控炮/用券。
             held = _accept_or_approach(
-                turn, role, claimed, commands, hold_idle=True,
+                turn, role, claimed, commands, hold_idle=False,
             )
             if role.unit_id in commands:
                 return "", ""
-            if held:
+            if held and turn.available_tasks():
                 _fill_idle_mine(
                     turn, role, claimed, commands, adjacent_only=True,
                 )
@@ -873,11 +917,8 @@ def _pioneer_day(
             )
         return "", ""
 
-    # 其余白天：一人买齐所需物品 → 回基地使用 → 控炮。
-    if (
-        role.find_item(WEAPON_UPGRADE_1)
-        or role.find_item(WEAPON_UPGRADE_2)
-    ) and _try_use_upgrade(turn, role, commands, claimed):
+    # 其余白天：先把手里的券用掉，再采购，避免商店↔墙体空跑。
+    if _try_use_upgrade(turn, role, commands, claimed):
         return "", ""
 
     if _try_use_summon(role, commands):
@@ -886,9 +927,10 @@ def _pioneer_day(
     spent = _buy_weapon_upgrade(turn, role, claimed, commands, turn.gold)
     if spent is not None:
         return "", ""
-    spent = _buy_wall_supplies(turn, role, claimed, commands, turn.gold)
-    if spent is not None:
-        return "", ""
+    if not _has_unused_supplies(role):
+        spent = _buy_wall_supplies(turn, role, claimed, commands, turn.gold)
+        if spent is not None:
+            return "", ""
     if (
         need_ritual_prep(turn, role)
         and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY
@@ -897,9 +939,10 @@ def _pioneer_day(
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
     ):
         return "", ""
-    spent = _buy_or_walk(turn, role, claimed, commands, turn.gold)
-    if spent is not None:
-        return "", ""
+    if not _has_unused_supplies(role):
+        spent = _buy_or_walk(turn, role, claimed, commands, turn.gold)
+        if spent is not None:
+            return "", ""
 
     if _try_use_upgrade(turn, role, commands, claimed):
         return "", ""
@@ -1016,9 +1059,13 @@ def _fill_idle_mine(
             mine = _adjacent_mine(turn, role, kind)
             if mine is None or mine in claimed:
                 continue
+            if not _night_mine_ok(turn, role, mine):
+                continue
             commands[role.unit_id] = collect_command(mine)
             claimed.add(mine)
             return True
+        if oscillation_bans(role.unit_id):
+            return _sidestep(turn, role, claimed, commands)
         return False
     return _mine_economy(
         turn,
@@ -1029,6 +1076,78 @@ def _fill_idle_mine(
         stay_near=stay_near,
         max_dist=max_dist,
     )
+
+
+def _has_unused_supplies(role: Unit) -> bool:
+    return bool(
+        role.find_item(WALL_FIXER)
+        or role.find_item(WALL_UPGRADE_1)
+        or role.find_item(WALL_UPGRADE_2)
+        or role.find_item(WEAPON_UPGRADE_1)
+        or role.find_item(WEAPON_UPGRADE_2)
+        or role.find_item(STATION_UPGRADE_1)
+        or role.find_item(STATION_UPGRADE_2)
+    )
+
+
+def _mining_unfinished(role: Unit) -> bool:
+    plan = MEM.mine_quota.get(role.unit_id)
+    if plan is None or role.backpack_full:
+        return False
+    kind, target = plan
+    return role.item_count(kind) < target
+
+
+def _should_defer_shop(turn: Turn, role: Unit) -> bool:
+    """采矿批次或未用券没做完时，除非已经站在商店旁，否则不去采购。"""
+    shop = turn.shop_pos()
+    if shop is not None and distance(role.pos, shop) <= 1:
+        return False
+    return _has_unused_supplies(role) or _mining_unfinished(role)
+
+
+def _sidestep(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """防抖把来回格禁了：先贴身采矿，否则走第三方向，不交空指令。"""
+    if role.unit_id in commands:
+        return False
+    if role.kind == WORKER and not role.backpack_full:
+        for kind in mine_rank(turn, keep_stone=False):
+            mine = _adjacent_mine(turn, role, kind)
+            if mine is None or mine in claimed:
+                continue
+            if not _night_mine_ok(turn, role, mine):
+                continue
+            commands[role.unit_id] = collect_command(mine)
+            claimed.add(mine)
+            return True
+    bans = (
+        set(oscillation_bans(role.unit_id))
+        | set(failed_cells(role.unit_id))
+        | set(claimed)
+        | set(turn.blocked(role))
+    )
+    bans.update(_robot_front_avoid(turn, role))
+    last = (MEM.move_hist.get(role.unit_id) or [None])[-1]
+    best: Pos | None = None
+    best_key: tuple[int, int, int] | None = None
+    for dx, dy in _NEIGHBOUR_STEPS:
+        pos = Pos(role.pos.x + dx, role.pos.y + dy)
+        if pos in bans or not turn.land(pos):
+            continue
+        stay_far = 0 if last is None or pos != last else 1
+        key = (stay_far, abs(dx) + abs(dy), pos.x + pos.y)
+        if best is None or key < best_key:
+            best, best_key = pos, key
+    if best is None:
+        return False
+    commands[role.unit_id] = move_command(best)
+    claimed.add(best)
+    return True
 
 
 def _stay_on_task(
@@ -1162,8 +1281,7 @@ def _buy_named_or_walk(
         note_purchase(name, role.unit_id, turn.round_no)
         return True
     if oscillation_bans(role.unit_id):
-        hold_idle(role.unit_id)
-        return True
+        return _sidestep(turn, role, claimed, commands)
     return False
 
 
@@ -1275,6 +1393,7 @@ def _evade_robots(
 
 def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     _tower_sites(turn)
+    _lock_basic_wall(turn)
     claimed: set[Pos] = set()
     used_controllers: set[int] = set()
     prompt = ""
@@ -1758,7 +1877,7 @@ def _try_use_upgrade(
                 commands[role.unit_id] = move_command(step)
                 return True
 
-    # 围墙升级优先于修复：建全阶段残血一级墙直接升二级。
+    # 围墙升级优先于修复：迎敌左右面未升完前，不升上下面。
     for voucher, need_level in (
         (WALL_UPGRADE_1, 1),
         (WALL_UPGRADE_2, 2),
@@ -1766,25 +1885,27 @@ def _try_use_upgrade(
         item = role.find_item(voucher)
         if not item:
             continue
-        walls = [
+        front_todo = _front_walls_needing_upgrade(turn, need_level)
+        # 迎敌正面（左右面）还有待升级：只对这些墙用券/走近
+        pool = front_todo or [
             wall for wall in turn.walls()
-            if wall.level == need_level and distance(role.pos, wall.pos) <= 1
+            if wall.level == need_level
         ]
-        if walls:
+        near = [
+            wall for wall in pool
+            if distance(role.pos, wall.pos) <= 1
+        ]
+        if near:
             wall = min(
-                walls,
+                near,
                 key=lambda unit: (_wall_priority(turn, unit.pos), unit.health),
             )
             commands[role.unit_id] = use_command(item, wall.pos)
             return True
         if not walk_walls:
             continue
-        # 先升迎敌面，再升双炮边，最后其它
         targets = sorted(
-            (
-                wall for wall in turn.walls()
-                if wall.level == need_level and wall.pos not in claimed
-            ),
+            (wall for wall in pool if wall.pos not in claimed),
             key=lambda unit: (
                 _wall_priority(turn, unit.pos),
                 distance(role.pos, unit.pos),
@@ -1836,13 +1957,22 @@ WALL_DAMAGED_RATIO = 0.8
 
 
 def _wall_priority(turn: Turn, pos: Pos) -> int:
-    """0=迎敌面，1=靠双炮那条边，2=其它。"""
-    front, _top, _bottom, _rear = _wall_face_cells(turn)
+    """0=迎敌左右面，1=背面左右面，2=上下面。升级券严格先左右后上下。"""
+    front, _top, _bottom, rear = _wall_face_cells(turn)
     if pos in set(front):
         return 0
-    if pos in set(_weapon_side_wall(turn)):
+    if pos in set(rear):
         return 1
     return 2
+
+
+def _front_walls_needing_upgrade(turn: Turn, need_level: int) -> list[Unit]:
+    """迎敌正面（左右面）上仍待升级的墙。"""
+    front = _front_wall_cells(turn)
+    return [
+        wall for wall in turn.walls()
+        if wall.level == need_level and wall.pos in front
+    ]
 
 
 def _wall_damaged(wall: Unit) -> bool:
@@ -1854,13 +1984,20 @@ def _team_items(turn: Turn, name: str) -> int:
 
 
 def _wall_upgrades_owed(turn: Turn) -> int:
-    """三级火箭出现后，计划圈内一级墙还差几张升级券。"""
+    """先凑齐迎敌左右面升级券；正面升完后再补其余基本围墙。"""
     if not _wall_completion_phase(turn):
         return 0
-    ring = set(_wall_ring(turn))
+    front = _front_wall_cells(turn)
+    front_todo = sum(
+        1 for wall in turn.walls()
+        if wall.level == 1 and wall.pos in front
+    )
+    if front_todo > 0:
+        return max(0, front_todo - _team_items(turn, WALL_UPGRADE_1))
+    basic = basic_wall_cells() or set(_wall_ring(turn))
     todo = sum(
         1 for wall in turn.walls()
-        if wall.level == 1 and (not ring or wall.pos in ring)
+        if wall.level == 1 and wall.pos in basic
     )
     return max(0, todo - _team_items(turn, WALL_UPGRADE_1))
 
@@ -2309,6 +2446,12 @@ def _mine_economy(
     plan = MEM.mine_quota.get(role.unit_id)
     if plan is not None:
         kind, target = plan
+        # Day1 附近无铁：丢掉远处铁配额，改走铜优先
+        if kind == IRON and prefer_day1_copper(turn):
+            MEM.mine_quota.pop(role.unit_id, None)
+            plan = None
+    if plan is not None:
+        kind, target = plan
         have = role.item_count(kind)
         if have >= target:
             MEM.mine_quota.pop(role.unit_id, None)
@@ -2328,8 +2471,12 @@ def _mine_economy(
     for kind in ranked:
         if kind in {COPPER, IRON}:
             batch = MINE_BATCH
-            # 囤铁期尽量采满背包，涨价日一次出清
-            if kind == IRON and turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+            # 囤铁期尽量采满背包，涨价日一次出清（Day1 附近无铁时不锁铁配额）
+            if (
+                kind == IRON
+                and turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL
+                and not prefer_day1_copper(turn)
+            ):
                 batch = max(MINE_BATCH, role.capacity)
             MEM.mine_quota[role.unit_id] = (kind, batch)
             if _mine_kind(
