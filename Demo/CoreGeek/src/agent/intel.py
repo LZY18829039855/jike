@@ -134,6 +134,9 @@ class Memory:
     summon_used: int = 0
     # 最近一次买围墙修复包是第几天（每天至少买 1 个）
     fixer_day: int = 0
+    # 上回合的 use 指令与 (物品, 目标格) 的累计失败次数，避免同一张券原地狂刷
+    last_use: dict[int, tuple[str, Pos]] = field(default_factory=dict)
+    use_failures: dict[tuple[str, Pos], int] = field(default_factory=dict)
     last_round: int = 0
     match_signature: tuple[Any, ...] = ()
 
@@ -175,6 +178,8 @@ def reset_memory() -> None:
     MEM.summon_day = 0
     MEM.summon_used = 0
     MEM.fixer_day = 0
+    MEM.last_use.clear()
+    MEM.use_failures.clear()
     MEM.pending_task_timeout = 0
     MEM.pending_task_pos = None
     MEM.pending_task_round = 0
@@ -289,6 +294,12 @@ def mark_prompt(turn: Turn) -> None:
 
 def _observe_moves(turn: Turn) -> None:
     for unit_id, ok in turn.last_action_ok.items():
+        used = MEM.last_use.get(unit_id)
+        if used is not None:
+            if ok:
+                MEM.use_failures.pop(used, None)
+            else:
+                MEM.use_failures[used] = MEM.use_failures.get(used, 0) + 1
         dest = MEM.last_move.get(unit_id)
         if ok:
             MEM.failed_steps.pop(unit_id, None)
@@ -317,9 +328,16 @@ def _observe_moves(turn: Turn) -> None:
 def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
     MEM.last_move.clear()
     MEM.last_build.clear()
+    MEM.last_use.clear()
     active_movers = set()
     for unit_id, command in commands.items():
         action = command.get("action")
+        if action == "use" and command.get("targetPos"):
+            raw = command["targetPos"][0]
+            MEM.last_use[unit_id] = (
+                str(command.get("name") or ""), Pos(int(raw["x"]), int(raw["y"])),
+            )
+            continue
         if action not in {"move", "build"}:
             continue
         targets = command.get("targetPos") or ()
@@ -340,6 +358,10 @@ def remember_commands(commands: dict[int, dict[str, Any]]) -> None:
     for unit_id in list(MEM.move_hist):
         if unit_id not in active_movers:
             MEM.move_hist.pop(unit_id, None)
+
+
+def use_failures(name: str, target: Pos) -> int:
+    return MEM.use_failures.get((name, target), 0)
 
 
 def oscillation_bans(unit_id: int) -> frozenset[Pos]:

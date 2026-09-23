@@ -35,6 +35,7 @@ from .intel import (
     wall_zone_seeds,
     weapon_ready,
     treasure_ready,
+    use_failures,
 )
 from .protocol import (
     BOMB,
@@ -1171,7 +1172,17 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     # 三火箭 CD=3：有怪时只需 1 人轮流控三炮；清场后不再占炮
     gunner = None if cleared else _pick_night_gunner(turn, used_controllers)
     if gunner is not None and gunner.unit_id not in commands:
-        if _try_use_upgrade(turn, gunner, commands, claimed, walk_walls=False):
+        # 贴身有就绪火箭且有目标：先开炮，用券/吃药放到冷却空档
+        can_fire = any(
+            weapon_ready(turn, tower)
+            and distance(gunner.pos, tower.pos) <= 1
+            and _attack_targets(turn, tower)
+            for tower in turn.weapons()
+        )
+        dying = gunner.health <= 100 and gunner.find_item(MEDICINE) is not None
+        if can_fire and not dying and _solo_rocket_fire(turn, gunner, claimed, commands):
+            used_controllers.add(gunner.unit_id)
+        elif _try_use_upgrade(turn, gunner, commands, claimed, walk_walls=False):
             used_controllers.add(gunner.unit_id)
         elif gunner.health <= 100:
             med = gunner.find_item(MEDICINE)
@@ -1573,10 +1584,19 @@ def _try_use_upgrade(
             (STATION_UPGRADE_2, 2),
         ):
             item = role.find_item(voucher)
-            if not item:
+            if not item or station.level != need_level:
                 continue
-            if _footprint_distance(role.pos, station_footprint(station.pos)) <= 1:
-                commands[role.unit_id] = use_command(item, station.pos)
+            # 目标格要选在自己 1 格内的基地格；选左上角可能隔 2 格，服务端判失败且不扣券
+            cells = [
+                cell for cell in station_footprint(station.pos)
+                if use_failures(item, cell) < USE_FAIL_LIMIT
+            ]
+            if not cells:
+                continue
+            near = [cell for cell in cells if distance(role.pos, cell) <= 1]
+            if near:
+                target = min(near, key=lambda cell: (cell.x, cell.y))
+                commands[role.unit_id] = use_command(item, target)
                 return True
             step = _step_toward(turn, role, station.pos, claimed, inside_only=True)
             if step is not None:
@@ -1653,6 +1673,7 @@ def _wall_max_hp(wall: Unit) -> int:
     return 500 * (min(max(wall.level, 1), 3) + 1)
 
 
+USE_FAIL_LIMIT = 2
 WALL_UPGRADE_FROM_DAY = 2
 WALL_FIXER_FROM_DAY = 2
 WALL_VOUCHER_BATCH = 4
@@ -1938,11 +1959,17 @@ def _wanted_purchase(
         if item:
             return item
     # 2) 基地保命升到 L2/L3
-    if station is not None and station.level == 1:
+    if (
+        station is not None and station.level == 1
+        and _team_items(turn, STATION_UPGRADE_1) == 0
+    ):
         item = can_buy(STATION_UPGRADE_1)
         if item:
             return item
-    if station is not None and station.level == 2:
+    if (
+        station is not None and station.level == 2
+        and _team_items(turn, STATION_UPGRADE_2) == 0
+    ):
         item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
