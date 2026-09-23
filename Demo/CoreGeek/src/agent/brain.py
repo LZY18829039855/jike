@@ -928,6 +928,55 @@ def _solve_task(
     return solve_evolve_task(turn, role, commands)
 
 
+def _front_x(turn: Turn) -> int | None:
+    front, _top, _bottom, _rear = _wall_face_cells(turn)
+    if not front:
+        return None
+    return front[0].x
+
+
+def _robots_attacking(turn: Turn) -> bool:
+    return (not turn.is_day) and bool(turn.hostile_robots())
+
+
+def _behind_robot_front(turn: Turn, pos: Pos) -> bool:
+    """正面墙内侧。夜里有怪时，不要走到墙外的进攻路线上。"""
+    if not _robots_attacking(turn):
+        return True
+    line = _front_x(turn)
+    if line is None:
+        return True
+    if _base_is_northwest(turn):
+        return pos.x < line
+    return pos.x > line
+
+
+def _robot_front_avoid(turn: Turn, role: Unit) -> set[Pos]:
+    """夜里有怪时，不许朝来敌方向迈步。
+
+    人还在墙内：正面墙及墙外整列都不能踩。
+    人已经在墙外：可以横移绕回缺口，但不能再往前靠近机器人。
+    """
+    if not _robots_attacking(turn):
+        return set()
+    line = _front_x(turn)
+    if line is None:
+        return set()
+    east = _base_is_northwest(turn)
+    blocked: set[Pos] = set()
+    for x in range(turn.width):
+        if east:
+            bad = x >= line if role.pos.x < line else x > role.pos.x
+        else:
+            bad = x <= line if role.pos.x > line else x < role.pos.x
+        if not bad:
+            continue
+        for y in range(turn.height):
+            blocked.add(Pos(x, y))
+    blocked.discard(role.pos)
+    return blocked
+
+
 def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     _tower_sites(turn)
     claimed: set[Pos] = set()
@@ -937,9 +986,21 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     pioneer = turn.pioneer()
     # 本波怪清完后不要再钉在炮上发呆，全员去采矿、卖货、采购
     cleared = not turn.hostile_robots()
+    station = turn.station()
 
+    # 开拓者已经冲到正面墙外：先退回，不要顺着进攻方向把任务做完
+    if (
+        pioneer is not None
+        and not cleared
+        and station is not None
+        and not _behind_robot_front(turn, pioneer.pos)
+    ):
+        step = _step_toward(turn, pioneer, station.pos, claimed)
+        if step is not None:
+            commands[pioneer.unit_id] = move_command(step)
+        used_controllers.add(pioneer.unit_id)
     # 夜里：已接任务继续做完；否则能开夜宝藏就开；否则继续刷任务点；再否则当炮手
-    if pioneer is not None and turn.phase_task.strip():
+    elif pioneer is not None and turn.phase_task.strip():
         prompt, execute_cmd = solve_evolve_task(turn, pioneer, commands)
         submitted = (commands.get(pioneer.unit_id) or {}).get("action") == "submitAnswer"
         if submitted:
@@ -979,11 +1040,20 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             # attack 挂在武器 ID 上，需标记炮手本回合已占用
             used_controllers.add(gunner.unit_id)
 
-    station = turn.station()
     anchor = station.pos if station is not None else None
     gunner_id = gunner.unit_id if gunner is not None else None
     for role in turn.controllable():
         if role.unit_id in commands or role.unit_id in used_controllers:
+            continue
+        # 已经冲到正面墙外：先退回墙内，不要顺着机器人打来的方向走
+        if (
+            not cleared
+            and station is not None
+            and not _behind_robot_front(turn, role.pos)
+        ):
+            step = _step_toward(turn, role, station.pos, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
             continue
         # 有怪时唯一炮手冷却空窗只贴身采；清场后和其他人一样出工
         if role.unit_id == gunner_id:
@@ -1799,6 +1869,7 @@ def _mine_kind(
         (
             pos for pos in turn.mines(kind)
             if pos not in claimed
+            and _behind_robot_front(turn, pos)
             and (stay_near is None or distance(pos, stay_near) <= max_dist)
         ),
         key=lambda pos: (distance(role.pos, pos), pos.x, pos.y),
@@ -1867,7 +1938,10 @@ def _step_onto(
     if role.pos == target:
         return None
     avoid = set(failed_cells(role.unit_id)) | set(oscillation_bans(role.unit_id)) | set(claimed)
-    avoid.discard(target)
+    avoid.update(_robot_front_avoid(turn, role))
+    avoid.discard(role.pos)
+    if _behind_robot_front(turn, target):
+        avoid.discard(target)
     step = next_step(turn, role, target, avoid)
     if step is None or (step != target and step in avoid):
         return None
@@ -1885,6 +1959,8 @@ def _step_toward(
     inside_only: bool = False,
 ) -> Pos | None:
     avoid = set(failed_cells(role.unit_id)) | set(oscillation_bans(role.unit_id)) | claimed
+    avoid.update(_robot_front_avoid(turn, role))
+    avoid.discard(role.pos)
     for stand in _stand_cells(turn, role, target, claimed, inside_only):
         if stand == role.pos:
             return None
@@ -1903,6 +1979,8 @@ def _step_toward(
         return step
     # 防抖把两极都禁了：尝试仅禁失败格再走一步，仍不行则待命
     soft = set(failed_cells(role.unit_id)) | claimed
+    soft.update(_robot_front_avoid(turn, role))
+    soft.discard(role.pos)
     step = next_step(turn, role, target, soft)
     if step is not None and step not in soft and step not in oscillation_bans(role.unit_id):
         claimed.add(step)
