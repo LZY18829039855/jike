@@ -172,6 +172,8 @@ def _day(
             night_gunner=(role.unit_id == night_gunner_id),
         )
         if role.unit_id not in commands:
+            if _rebuild_destroyed_walls(turn, role, claimed, commands):
+                continue
             if _need_early_walls(turn):
                 # Day1 墙未齐：囤石未满才采石，够了只砌墙
                 if _day1_stockpiling_stone(turn):
@@ -213,19 +215,44 @@ def _team_stone(turn: Turn) -> int:
 
 
 def _destroyed_wall_sites(turn: Turn) -> list[Pos]:
-    """曾建成、现已消失的计划墙位，视为需要立即重建的缺口。"""
+    """曾建成、现已消失的墙位，视为需要立即重建的缺口。
+
+    不限于当天缩短后的计划圈：第一天砌满、夜里被砸掉的格子也要补上。
+    炮位/操炮通道不重建，避免把人封在墙外。
+    """
     standing = {wall.pos for wall in turn.walls()}
-    planned = set(_wall_ring(turn))
+    reserved = _weapon_keep_open(turn)
     return sorted(
         (
             pos for pos in wall_zone_seeds()
-            if pos in planned
-            and pos not in standing
+            if pos not in standing
+            and pos not in reserved
             and pos not in bad_build_cells()
             and turn.land(pos)
         ),
         key=lambda pos: (_wall_priority(turn, pos), pos.x, pos.y),
     )
+
+
+def _rebuild_destroyed_walls(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """围墙被打烂后立刻新建：有石头去砌，没石头去采，不插队卖矿/升炮/购物。"""
+    if role.kind != WORKER:
+        return False
+    sites = _destroyed_wall_sites(turn)
+    if not sites:
+        return False
+    if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
+        turn, role, sites, claimed, commands, hunt_stone=False,
+    ):
+        return True
+    if role.item_count(WALL_MATERIAL) == 0:
+        return _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
+    return False
 
 
 def _day1_wall_progress(turn: Turn) -> float:
@@ -261,6 +288,8 @@ def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
     """三面墙基本齐、且不临夜缺墙时，视为围墙无风险。"""
     if not walls_missing:
         return True
+    if _wall_completion_phase(turn) and walls_missing:
+        return False
     if turn.day_no <= 1 and walls_missing:
         return False
     if _need_early_walls(turn):
@@ -277,6 +306,10 @@ def _pick_mason_ids(turn: Turn, walls_missing: list[Pos]) -> set[int]:
     workers = list(turn.workers())
     if not workers:
         return set()
+    if _destroyed_wall_sites(turn):
+        return {role.unit_id for role in workers}
+    if _wall_completion_phase(turn) and walls_missing:
+        return {role.unit_id for role in workers}
     if _need_early_walls(turn):
         return {role.unit_id for role in workers}
     if _walls_safe(turn, walls_missing) and _team_stone(turn) >= STONE_TARGET:
@@ -391,6 +424,10 @@ def _worker_day(
             commands[role.unit_id] = use_command(med)
             return budget
 
+    # 1.5) 围墙被打烂：先于卖矿、升炮、用券、购物，立刻新建缺口。
+    if _rebuild_destroyed_walls(turn, role, claimed, commands):
+        return budget
+
     # Day3 先清空铜铁再做升级和采购；协议每回合只能卖一种矿，
     # 所以会先卖涨价铁，下一回合继续卖铜。
     if _day3_ores_left(turn, role) and _sell_or_walk(
@@ -409,19 +446,6 @@ def _worker_day(
     # 3) 天亮后拆掉夜里封上的缺口，否则全队出不了门
     if not turn.near_night and _open_gate(turn, role, claimed, commands):
         return budget
-
-    # 3.5) 已建围墙被摧毁：购物、升炮、采经济矿之前立即补墙。
-    destroyed_walls = _destroyed_wall_sites(turn)
-    if destroyed_walls:
-        if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
-            turn, role, destroyed_walls, claimed, commands, hunt_stone=False,
-        ):
-            return budget
-        if (
-            _team_stone(turn) < STONE_TARGET
-            and _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
-        ):
-            return budget
 
     # 4) 夜间临近：仅指定 1 名炮手回防，另一人继续挖矿
     if turn.near_night and turn.weapons() and night_gunner:
@@ -493,8 +517,8 @@ def _worker_day(
             spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
             if spent is not None:
                 return budget - spent
-        if not day1_iron:
-            # 非 Day1：升级未完成时只砌迎敌面
+        if not day1_iron and not _wall_completion_phase(turn):
+            # 非 Day1、尚未进入建全阶段：升级未完成时只砌迎敌面
             front = _front_wall_cells(turn)
             walls_missing = [pos for pos in walls_missing if pos in front]
 
@@ -534,10 +558,52 @@ def _worker_day(
     return budget
 
 
+PIONEER_TASK_DAYS = frozenset({1, 8})
+
+
 def _firepower_ready(turn: Turn) -> bool:
     """三门火箭均达到二级，才算核心火力成形。"""
     weapons = turn.weapons()
     return len(weapons) >= 3 and all(tower.level >= 2 for tower in weapons)
+
+
+def _has_level3_weapon(turn: Turn) -> bool:
+    return any(tower.level >= 3 for tower in turn.weapons())
+
+
+def _wall_completion_phase(turn: Turn) -> bool:
+    """第三天出现三级火箭后：把三面墙砌满并升级。"""
+    return turn.day_no >= 3 and _has_level3_weapon(turn)
+
+
+def _pioneer_is_shopper(turn: Turn) -> bool:
+    """除第1、8天做任务外，白天由开拓者统一采购。"""
+    return (
+        turn.is_day
+        and turn.day_no not in PIONEER_TASK_DAYS
+        and turn.pioneer() is not None
+    )
+
+
+def _role_may_shop(turn: Turn, role: Unit) -> bool:
+    if not _pioneer_is_shopper(turn):
+        return True
+    pioneer = turn.pioneer()
+    return pioneer is not None and role.unit_id == pioneer.unit_id
+
+
+def _walls_finished(turn: Turn) -> bool:
+    """计划圈已砌满，且圈内墙都至少二级。"""
+    ring = [
+        pos for pos in _wall_ring(turn)
+        if pos not in bad_build_cells() and turn.land(pos)
+    ]
+    if not ring:
+        return True
+    standing = {wall.pos: wall for wall in turn.walls()}
+    if any(pos not in standing for pos in ring):
+        return False
+    return all(standing[pos].level >= 2 for pos in ring)
 
 
 def _front_wall_cells(turn: Turn) -> set[Pos]:
@@ -556,11 +622,12 @@ def _next_weapon_voucher(turn: Turn) -> str | None:
     # 第二天两座 L2 达标后停手，把第一张三级券留到第三天再买。
     if turn.day_no < 3:
         return None
-    # 第三天优先让其中一座 L2 升到 L3，再补第三座 L2。
-    if not any(tower.level >= 3 for tower in weapons) and any(
-        tower.level == 2 for tower in weapons
-    ):
+    # 第三天优先让其中一座 L2 升到 L3。
+    if not _has_level3_weapon(turn) and any(tower.level == 2 for tower in weapons):
         return WEAPON_UPGRADE_2
+    # 三级达标后先建全并升级围墙，墙完成前不再追买武器券。
+    if _wall_completion_phase(turn) and not _walls_finished(turn):
+        return None
     if any(tower.level == 1 for tower in weapons):
         return WEAPON_UPGRADE_1
     if any(tower.level == 2 for tower in weapons):
@@ -585,10 +652,14 @@ def _team_item_count(turn: Turn, name: str) -> int:
 
 
 def _weapon_upgrade_buyer_id(turn: Turn) -> int | None:
-    """全局固定一名工人采购武器券；失效或火力满级后才重选。"""
+    """开拓者白天统一采购；第1、8天或开拓者缺席时才由工人顶上。"""
     if _next_weapon_voucher(turn) is None:
         MEM.weapon_buyer_id = None
         return None
+    pioneer = turn.pioneer()
+    if pioneer is not None and turn.day_no not in PIONEER_TASK_DAYS:
+        MEM.weapon_buyer_id = pioneer.unit_id
+        return pioneer.unit_id
     workers = list(turn.workers())
     if not workers:
         MEM.weapon_buyer_id = None
@@ -758,19 +829,8 @@ def _pioneer_day(
     ):
         return "", ""
 
-    # 第6-7天仍缺祭品：打断当前事务去买齐，确保第8天能开
-    if (
-        need_ritual_prep(turn, role)
-        and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY
-        and turn.day_no < FIXED_TREASURE_DAY
-        and not turn.near_night
-        and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
-    ):
-        return "", ""
-
-    # —— 开拓者金币主线：刷自进化任务点 ——
+    # 已接任务必须做完；第1、8天才主动去接新任务。
     if turn.phase_task.strip():
-        # 先求解/交卷，避免超时离点时把刚拿到的答案扔掉
         prompt, execute_cmd = solve_evolve_task(turn, role, commands)
         submitted = (commands.get(role.unit_id) or {}).get("action") == "submitAnswer"
         if submitted:
@@ -784,7 +844,51 @@ def _pioneer_day(
             return prompt, execute_cmd
         return "", ""
 
-    # 第8天前空档：仅 Day6 起才买祭品（前期钱留给炮墙与铁矿）
+    if turn.day_no in PIONEER_TASK_DAYS:
+        if should_prioritize(turn):
+            held = _accept_or_approach(
+                turn, role, claimed, commands, hold_idle=True,
+            )
+            if role.unit_id in commands:
+                return "", ""
+            if held:
+                _fill_idle_mine(
+                    turn, role, claimed, commands, adjacent_only=True,
+                )
+                return "", ""
+        if turn.weapons() and (turn.near_night or not _near_task_point(turn, role)):
+            _man_tower(turn, role, claimed, commands, prefer_inside=True)
+        elif towers_missing and not _near_task_point(turn, role):
+            _step_or_idle(turn, role, towers_missing[0], claimed, commands)
+        if role.unit_id not in commands:
+            at_tower = any(
+                distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
+            )
+            _fill_idle_mine(
+                turn,
+                role,
+                claimed,
+                commands,
+                adjacent_only=turn.near_night and at_tower,
+            )
+        return "", ""
+
+    # 其余白天：一人买齐所需物品 → 回基地使用 → 控炮。
+    if (
+        role.find_item(WEAPON_UPGRADE_1)
+        or role.find_item(WEAPON_UPGRADE_2)
+    ) and _try_use_upgrade(turn, role, commands, claimed):
+        return "", ""
+
+    if _try_use_summon(role, commands):
+        return "", ""
+
+    spent = _buy_weapon_upgrade(turn, role, claimed, commands, turn.gold)
+    if spent is not None:
+        return "", ""
+    spent = _buy_wall_supplies(turn, role, claimed, commands, turn.gold)
+    if spent is not None:
+        return "", ""
     if (
         need_ritual_prep(turn, role)
         and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY
@@ -793,38 +897,17 @@ def _pioneer_day(
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
     ):
         return "", ""
+    spent = _buy_or_walk(turn, role, claimed, commands, turn.gold)
+    if spent is not None:
+        return "", ""
 
-    # 刷任务：有就绪就接；白天冷却贴点时只贴身采，不走开错过任务
-    if should_prioritize(turn):
-        held = _accept_or_approach(
-            turn, role, claimed, commands, hold_idle=True,
-        )
-        if role.unit_id in commands:
-            return "", ""
-        if held:
-            _fill_idle_mine(
-                turn, role, claimed, commands, adjacent_only=True,
-            )
-            return "", ""
+    if _try_use_upgrade(turn, role, commands, claimed):
+        return "", ""
 
-    # 近夜或不在任务点：才去控炮
-    if turn.weapons() and (turn.near_night or not _near_task_point(turn, role)):
+    if turn.weapons():
         _man_tower(turn, role, claimed, commands, prefer_inside=True)
-    elif towers_missing and not _near_task_point(turn, role):
+    elif towers_missing:
         _step_or_idle(turn, role, towers_missing[0], claimed, commands)
-
-    # 白天空档：开拓者也采矿（任务/宝藏/控炮都轮空时）
-    if role.unit_id not in commands:
-        at_tower = any(
-            distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
-        )
-        _fill_idle_mine(
-            turn,
-            role,
-            claimed,
-            commands,
-            adjacent_only=turn.near_night and at_tower,
-        )
     return "", ""
 
 
@@ -1288,7 +1371,9 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             else:
                 _solo_rocket_fire(turn, role, claimed, commands)
             continue
-        # 围墙掉血就拿修复包去补；夜里寻路自带不越正面墙、不贴机器人
+        # 围墙被打烂先新建；残墙再拿修复包补。夜里寻路不越正面墙、不贴机器人。
+        if _rebuild_destroyed_walls(turn, role, claimed, commands):
+            continue
         if _fix_walls(turn, role, claimed, commands):
             continue
         if role.kind != WORKER:
@@ -1297,17 +1382,6 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             elif cleared:
                 _buy_or_walk(turn, role, claimed, commands, turn.gold)
             continue
-        destroyed_walls = _destroyed_wall_sites(turn)
-        if destroyed_walls:
-            if role.item_count(WALL_MATERIAL) > 0 and _wall_work(
-                turn, role, destroyed_walls, claimed, commands, hunt_stone=False,
-            ):
-                continue
-            if (
-                _team_stone(turn) < STONE_TARGET
-                and _mine_kind(turn, role, WALL_MATERIAL, claimed, commands)
-            ):
-                continue
         # 工人夜里不守炮：有必要物品就采购，否则继续采矿。
         spent = _buy_or_walk(
             turn, role, claimed, commands, night_budget,
@@ -1684,7 +1758,7 @@ def _try_use_upgrade(
                 commands[role.unit_id] = move_command(step)
                 return True
 
-    # 围墙升级优先于修复：Day2 残血一级墙直接升二级。
+    # 围墙升级优先于修复：建全阶段残血一级墙直接升二级。
     for voucher, need_level in (
         (WALL_UPGRADE_1, 1),
         (WALL_UPGRADE_2, 2),
@@ -1780,12 +1854,13 @@ def _team_items(turn: Turn, name: str) -> int:
 
 
 def _wall_upgrades_owed(turn: Turn) -> int:
-    """第 2 天起要升到二级的墙（迎敌面 + 双炮边）里，还差几张券没买。"""
-    if turn.day_no < WALL_UPGRADE_FROM_DAY:
+    """三级火箭出现后，计划圈内一级墙还差几张升级券。"""
+    if not _wall_completion_phase(turn):
         return 0
+    ring = set(_wall_ring(turn))
     todo = sum(
         1 for wall in turn.walls()
-        if wall.level == 1 and _wall_priority(turn, wall.pos) <= 1
+        if wall.level == 1 and (not ring or wall.pos in ring)
     )
     return max(0, todo - _team_items(turn, WALL_UPGRADE_1))
 
@@ -1810,17 +1885,20 @@ def _buy_wall_supplies(
 ) -> int | None:
     """白天去商店买墙券/修复包，返回花掉的金币；没有要买的返回 None。"""
     shop = turn.shop_pos()
-    if shop is None or not turn.is_day or _priority_weapon_goal_pending(turn):
+    if (
+        shop is None
+        or not turn.is_day
+        or not _role_may_shop(turn, role)
+        or _priority_weapon_goal_pending(turn)
+    ):
         return None
     want: tuple[str, int] | None = None
     owed = min(_wall_upgrades_owed(turn), WALL_VOUCHER_BATCH)
-    # 第一晚受损后，Day2 迎敌面直接升级：先买升级券，不先买修复包。
-    if turn.day_no == 2 and owed > 0:
+    # 建全阶段先买升级券；修复包只在没有待升墙时补。
+    if owed > 0:
         want = (WALL_UPGRADE_1, owed)
     elif _fixer_owed(turn):
         want = (WALL_FIXER, 1)
-    elif owed > 0:
-        want = (WALL_UPGRADE_1, owed)
     if want is None:
         return None
     name, num = want
@@ -2003,7 +2081,7 @@ def _buy_or_walk(
     budget: int,
 ) -> int | None:
     shop = turn.shop_pos()
-    if shop is None:
+    if shop is None or not _role_may_shop(turn, role):
         return None
 
     want = _wanted_purchase(turn, role, budget)
@@ -2079,12 +2157,8 @@ def _wanted_purchase(
         item = can_buy(STATION_UPGRADE_2)
         if item:
             return item
-    # 3) 第 2 天起或火力成形后升级围墙
-    if (
-        turn.day_no >= WALL_UPGRADE_FROM_DAY
-        or _firepower_ready(turn)
-        or len(weapons) < 3
-    ):
+    # 3) 三级火箭后建全围墙，再买墙升级券
+    if _wall_completion_phase(turn):
         if any(wall.level == 1 for wall in walls):
             item = can_buy(WALL_UPGRADE_1)
             if item:
@@ -2763,10 +2837,11 @@ def _wall_build_plan(turn: Turn) -> tuple[list[Pos], list[Pos], list[Pos]]:
     """实际要砌的格子。
 
     Day1：迎敌面 + 上下两面满长（约 4+6+6=16 格）。
-    其后：远离双炮的一侧缩短；靠近两座火箭的那条边始终砌满 6 格。
+    第三天三级火箭后：再次砌满三面。
+    其间：远离双炮的一侧缩短；靠近两座火箭的那条边始终砌满 6 格。
     """
     front, top, bottom, _rear = _wall_face_cells(turn)
-    if turn.day_no <= 1:
+    if turn.day_no <= 1 or _wall_completion_phase(turn):
         return front, list(top), list(bottom)
     nw = _base_is_northwest(turn)
     trim = _side_trim_count(turn)
