@@ -118,6 +118,8 @@ class Memory:
     weapon_buyer_id: int | None = None
     # 两名工人的围墙施工区：top / bottom（从上/下边最外侧砌到左右面碰头）
     wall_lane: dict[int, str] = field(default_factory=dict)
+    # 开局石矿分工：unit -> 石矿坐标，避免两人挤同一处
+    stone_mine: dict[int, Pos] = field(default_factory=dict)
     # 采卖计划：unit -> (矿种, 目标数量)
     mine_quota: dict[int, tuple[str, int]] = field(default_factory=dict)
     # 本回合堵路待命，禁止再被 idle 支使去抖
@@ -170,6 +172,7 @@ def reset_memory() -> None:
     MEM.pending_buy.clear()
     MEM.weapon_buyer_id = None
     MEM.wall_lane.clear()
+    MEM.stone_mine.clear()
     MEM.mine_quota.clear()
     MEM.idle_hold.clear()
     MEM.failed_steps.clear()

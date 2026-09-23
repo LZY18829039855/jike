@@ -164,6 +164,7 @@ def _day(
     workers = [role for role in turn.workers() if role.unit_id not in commands]
     mason_ids = _pick_mason_ids(turn, free_walls)
     wall_lanes = _day1_wall_lanes(turn, workers, free_walls)
+    _ensure_day1_stone_mines(turn, workers)
     # 临夜只需 1 人贴塔（与夜间单炮手一致），另一人继续挖矿
     night_gunner_id = _pick_day_gunner_id(turn, workers)
 
@@ -223,19 +224,19 @@ def _destroyed_wall_sites(turn: Turn) -> list[Pos]:
 
 
 def _full_wall_ring(turn: Turn) -> tuple[Pos, ...]:
-    """第一天基本墙：上下边满长 + 迎敌面各拐 3 格（双人施工链并集）。"""
+    """第一天基本墙：上下边各 4 + 迎敌柱 6（两角公用），并集 12 格。"""
     top_chain, bottom_chain = _day1_mason_chains(turn)
     return tuple(dict.fromkeys([*top_chain, *bottom_chain]))
 
 
 def _lock_basic_wall(turn: Turn) -> None:
-    """第一天把满墙计划锁定为基本围墙；之后只增不改。"""
+    """第一天把 12 格基本墙计划锁定；之后只增不改。"""
     if turn.day_no == 1:
         note_basic_wall(set(_full_wall_ring(turn)))
         note_basic_wall({wall.pos for wall in turn.walls()})
         return
     if not basic_wall_cells():
-        # 中途重启记忆时，用满墙规格 + 曾站住的墙位回填
+        # 中途重启记忆时，用基本墙规格 + 曾站住的墙位回填
         note_basic_wall(set(_full_wall_ring(turn)))
         note_basic_wall(set(wall_zone_seeds()))
 
@@ -840,7 +841,12 @@ def _wall_work(
     mine = _adjacent_mine(turn, role, WALL_MATERIAL)
     # Day1 手里有石就按链砌，旁边有矿也不回头补采
     stock_to = 0 if turn.day_no <= 1 else STONE_BATCH
-    if mine is not None and stones < stock_to:
+    if (
+        mine is not None
+        and stones < stock_to
+        and mine not in claimed
+        and mine not in _others_stone_mines(role.unit_id)
+    ):
         commands[role.unit_id] = collect_command(mine)
         claimed.add(mine)
         return True
@@ -1069,6 +1075,8 @@ def _fill_idle_mine(
             mine = _adjacent_mine(turn, role, kind)
             if mine is None or mine in claimed:
                 continue
+            if kind == WALL_MATERIAL and mine in _others_stone_mines(role.unit_id):
+                continue
             if not _night_mine_ok(turn, role, mine):
                 continue
             commands[role.unit_id] = collect_command(mine)
@@ -1129,6 +1137,8 @@ def _sidestep(
         for kind in mine_rank(turn, keep_stone=False):
             mine = _adjacent_mine(turn, role, kind)
             if mine is None or mine in claimed:
+                continue
+            if kind == WALL_MATERIAL and mine in _others_stone_mines(role.unit_id):
                 continue
             if not _night_mine_ok(turn, role, mine):
                 continue
@@ -2634,6 +2644,53 @@ def _adjacent_mine(turn: Turn, role: Unit, kind: str) -> Pos | None:
     return mines[0] if mines else None
 
 
+def _others_stone_mines(unit_id: int) -> set[Pos]:
+    """其他工人已锁定的石矿，本工人不得再去。"""
+    return {
+        pos for uid, pos in MEM.stone_mine.items() if uid != unit_id
+    }
+
+
+def _ensure_day1_stone_mines(turn: Turn, workers: list[Unit]) -> None:
+    """开局两工人各锁一处不同石矿；非 Day1 采石阶段则清空。"""
+    if turn.day_no > 1 or not _need_early_walls(turn):
+        MEM.stone_mine.clear()
+        return
+    pair = sorted(
+        (role for role in workers if role.kind == WORKER),
+        key=lambda role: role.unit_id,
+    )[:2]
+    mines = list(turn.stone_mines())
+    if len(pair) < 2 or len(mines) < 2:
+        return
+    mine_set = set(mines)
+    w0, w1 = pair
+    cur0 = MEM.stone_mine.get(w0.unit_id)
+    cur1 = MEM.stone_mine.get(w1.unit_id)
+    if (
+        cur0 in mine_set
+        and cur1 in mine_set
+        and cur0 != cur1
+    ):
+        return
+    best: tuple[Pos, Pos] | None = None
+    best_key: tuple[int, int, int, int, int, int] | None = None
+    for i, first in enumerate(mines):
+        for second in mines[i + 1:]:
+            for a0, a1 in ((first, second), (second, first)):
+                key = (
+                    distance(w0.pos, a0) + distance(w1.pos, a1),
+                    max(distance(w0.pos, a0), distance(w1.pos, a1)),
+                    a0.x, a0.y, a1.x, a1.y,
+                )
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = (a0, a1)
+    if best is None:
+        return
+    MEM.stone_mine = {w0.unit_id: best[0], w1.unit_id: best[1]}
+
+
 def _mine_kind(
     turn: Turn,
     role: Unit,
@@ -2648,14 +2705,22 @@ def _mine_kind(
         return False
     if role.backpack_full:
         return False
+    reserved = _others_stone_mines(role.unit_id) if kind == WALL_MATERIAL else set()
+    preferred = MEM.stone_mine.get(role.unit_id) if kind == WALL_MATERIAL else None
     mines = sorted(
         (
             pos for pos in turn.mines(kind)
             if pos not in claimed
+            and pos not in reserved
             and _night_mine_ok(turn, role, pos)
             and (stay_near is None or distance(pos, stay_near) <= max_dist)
         ),
-        key=lambda pos: (distance(role.pos, pos), pos.x, pos.y),
+        key=lambda pos: (
+            0 if preferred is not None and pos == preferred else 1,
+            distance(role.pos, pos),
+            pos.x,
+            pos.y,
+        ),
     )
     for mine in mines:
         if role.pos != mine and distance(role.pos, mine) <= 1:
@@ -3033,22 +3098,27 @@ def _clean_wall_cells(turn: Turn, cells: list[Pos]) -> list[Pos]:
 
 
 def _day1_mason_chains(turn: Turn) -> tuple[list[Pos], list[Pos]]:
-    """Day1 双链。
+    """Day1 双链：基本墙 12 格（直角炮布局，上下不必砌满）。
 
-    右下基地：从上/下边的右端（背面）向左砌到左端，再沿左墙各拐 3 格。
-    左上基地对称：从左端向右砌到右端，再沿右墙各拐 3 格。
+    上下边各取靠迎敌的 4 格；迎敌柱 6 格（含与上下公用的两角）。
+    右下基地：从上/下边远端向左砌 4 格，再沿左柱上下各分 3 格。
+    左上基地对称。
     """
     front, top, bottom, _rear = _wall_face_cells(turn)
     if not front and not top and not bottom:
         return [], []
-    if _base_is_northwest(turn):
-        top_arm = sorted(top, key=lambda pos: pos.x)
-        bottom_arm = sorted(bottom, key=lambda pos: pos.x)
+    nw = _base_is_northwest(turn)
+    top4 = _side_toward_front(top, nw, 4)
+    bottom4 = _side_toward_front(bottom, nw, 4)
+    front6 = _front_column_6(front, top4, bottom4)
+    if nw:
+        top_arm = sorted(top4, key=lambda pos: pos.x)
+        bottom_arm = sorted(bottom4, key=lambda pos: pos.x)
     else:
-        top_arm = sorted(top, key=lambda pos: -pos.x)
-        bottom_arm = sorted(bottom, key=lambda pos: -pos.x)
-    down = sorted(front, key=lambda pos: -pos.y)[:3]
-    up = sorted(front, key=lambda pos: pos.y)[:3]
+        top_arm = sorted(top4, key=lambda pos: -pos.x)
+        bottom_arm = sorted(bottom4, key=lambda pos: -pos.x)
+    down = sorted(front6, key=lambda pos: -pos.y)[:3]
+    up = sorted(front6, key=lambda pos: pos.y)[:3]
     return (
         _clean_wall_cells(turn, [*top_arm, *down]),
         _clean_wall_cells(turn, [*bottom_arm, *up]),
@@ -3241,6 +3311,30 @@ def _half_toward_front(cells: list[Pos], northwest: bool) -> list[Pos]:
     return ordered[:half]
 
 
+def _side_toward_front(
+    cells: list[Pos], northwest: bool, count: int,
+) -> list[Pos]:
+    """上下边取靠迎敌一侧的 count 格（基本墙上下各 4）。"""
+    if not cells or count <= 0:
+        return []
+    ordered = sorted(cells, key=lambda pos: pos.x)
+    keep = min(count, len(ordered))
+    if northwest:
+        return ordered[-keep:]
+    return ordered[:keep]
+
+
+def _front_column_6(
+    front: list[Pos], top: list[Pos], bottom: list[Pos],
+) -> list[Pos]:
+    """迎敌柱 6 格：原左右面 4 格 + 上下边迎敌角（与上下公用）。"""
+    if not front:
+        return []
+    front_x = front[0].x
+    extra = [pos for pos in (*top, *bottom) if pos.x == front_x]
+    return list(dict.fromkeys([*front, *extra]))
+
+
 def _side_trim_count(turn: Turn) -> int:
     """按全局战况缩短上下侧：早中期/低压多缩 2 格，受压少缩 1 格。"""
     robots = len(turn.hostile_robots())
@@ -3280,12 +3374,18 @@ def _weapon_side_wall(turn: Turn) -> list[Pos]:
 def _wall_build_plan(turn: Turn) -> tuple[list[Pos], list[Pos], list[Pos]]:
     """实际要砌的格子。
 
-    Day1：迎敌面 + 上下两面满长（约 4+6+6=16 格）。
+    Day1 基本墙：上下各 4 + 迎敌柱 6（两角公用）= 12 格。
     第三天三级火箭后：再次砌满三面。
     其间：远离双炮的一侧缩短；靠近两座火箭的那条边始终砌满 6 格。
     """
     front, top, bottom, _rear = _wall_face_cells(turn)
-    if turn.day_no <= 1 or _wall_completion_phase(turn):
+    if turn.day_no <= 1:
+        nw = _base_is_northwest(turn)
+        top4 = _side_toward_front(top, nw, 4)
+        bottom4 = _side_toward_front(bottom, nw, 4)
+        front6 = _front_column_6(front, top4, bottom4)
+        return front6, top4, bottom4
+    if _wall_completion_phase(turn):
         return front, list(top), list(bottom)
     nw = _base_is_northwest(turn)
     trim = _side_trim_count(turn)
@@ -3350,7 +3450,7 @@ def _gate_cell(turn: Turn) -> Pos | None:
 
 
 def _wall_order(turn: Turn, seal: bool = False) -> tuple[Pos, ...]:
-    """建造顺序。Day1 按背面角落向迎敌面各拐 3 格；其后双链碰头。"""
+    """建造顺序。Day1 基本墙 12 格双链；其后双链碰头。"""
     del seal
     if turn.station() is None:
         return ()
