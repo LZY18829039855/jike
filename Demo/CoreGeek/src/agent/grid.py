@@ -15,6 +15,8 @@ def next_step(
     moving: Unit,
     goal: Pos,
     extra_blocked: frozenset[Pos] | set[Pos] = frozenset(),
+    *,
+    allow_greedy: bool = True,
 ) -> Pos | None:
     blocked = set(turn.blocked(moving))
     blocked.update(extra_blocked)
@@ -53,6 +55,8 @@ def next_step(
                     step,
                 ),
             )
+    if not allow_greedy:
+        return None
     return _greedy_step(turn, moving, goal, blocked)
 
 
