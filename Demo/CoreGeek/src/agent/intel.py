@@ -28,6 +28,12 @@ FIXED_TREASURE_PHASE = "day"
 FIXED_TREASURE_POS = Pos(3, 3)
 FIXED_TREASURE_ITEMS = ("AcientTablet", "StarSand", "FlameBreath")
 
+# 本图官方消息已锁定：铁矿 Day3–4 短缺涨价（与两局日志一致）。
+# Day1–2 囤铁；Day3–4 停采并高价卖铁；Day5 起恢复，主采铜（铜价高于铁）。
+FIXED_IRON_STOCKPILE_UNTIL = 2
+FIXED_IRON_SELL_DAYS = frozenset({3, 4})
+FIXED_IRON_BLOCK_DAYS = frozenset({3, 4})
+
 _CN_NUM = {
     "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
@@ -183,6 +189,7 @@ def observe(turn: Turn) -> None:
 
     _observe_threat(turn)
     apply_fixed_treasure()
+    apply_fixed_iron_schedule(turn)
 
     folk = turn.folk_legends.strip()
     if folk and folk != MEM.last_folk:
@@ -202,6 +209,9 @@ def observe(turn: Turn) -> None:
             MEM.events = [item for item in MEM.events if item.ore != event.ore]
             MEM.events.append(event)
         _log_official_news(turn, news, event)
+
+    # 新闻解析后再盖一次，保证铁矿日程不被错误解析改写
+    apply_fixed_iron_schedule(turn)
 
     _observe_task(turn)
     _observe_moves(turn)
@@ -610,6 +620,8 @@ def _default_field(key: str, blob: str, turn: Turn) -> Any:
 
 
 def mine_blocked(turn: Turn, ore: str) -> bool:
+    if ore == IRON and turn.day_no in FIXED_IRON_BLOCK_DAYS:
+        return True
     for event in MEM.events:
         if event.ore == ore and event.kind == "shortage":
             if event.start_day <= turn.day_no <= event.end_day:
@@ -618,6 +630,9 @@ def mine_blocked(turn: Turn, ore: str) -> bool:
 
 
 def hold_ore(turn: Turn, ore: str) -> bool:
+    """Day1–2 严格囤铁，涨价日再卖。"""
+    if ore == IRON and turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+        return True
     for event in MEM.events:
         if event.ore == ore and event.kind == "shortage":
             if turn.day_no < event.start_day:
@@ -628,6 +643,8 @@ def hold_ore(turn: Turn, ore: str) -> bool:
 def dump_ore(turn: Turn, ore: str) -> bool:
     if hold_ore(turn, ore):
         return False
+    if ore == IRON and turn.day_no in FIXED_IRON_SELL_DAYS:
+        return True
     for event in MEM.events:
         if event.ore != ore:
             continue
@@ -643,9 +660,14 @@ def dump_ore(turn: Turn, ore: str) -> bool:
 
 
 def upcoming_hot_ore(turn: Turn) -> str | None:
+    # Day1–2：全力囤铁；之后铜价优先，不再把铁当热点
+    if turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+        return IRON
     soon: list[MarketEvent] = []
     for event in MEM.events:
         if event.kind == "shortage" and turn.day_no < event.start_day:
+            if event.ore == IRON:
+                continue
             soon.append(event)
     if not soon:
         return None
@@ -654,18 +676,21 @@ def upcoming_hot_ore(turn: Turn) -> str | None:
 
 
 def mine_rank(turn: Turn, keep_stone: bool) -> list[str]:
-    """工人采金顺序：涨价矿 > 铜 > 铁；石头只为砌墙，不进金币主线。"""
+    """写死行情：Day1–2 铁优先；Day3–4 铁停采；Day5+ 铜优先于铁。"""
     hot = upcoming_hot_ore(turn)
     scored: list[tuple[int, int, str]] = []
     for ore in (COPPER, IRON, WALL_MATERIAL):
         if mine_blocked(turn, ore):
             continue
-        # 基础档：铜 > 铁 > 石
-        tier = 3 if ore == COPPER else 2 if ore == IRON else 0
+        # 基础档：铜 > 铁 > 石；囤铁期铁压过铜
+        if turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+            tier = 4 if ore == IRON else 3 if ore == COPPER else 0
+        else:
+            tier = 3 if ore == COPPER else 2 if ore == IRON else 0
         score = turn.ore_price(ore) * 10
         if hot == ore:
             score += 100
-            tier = 4
+            tier = max(tier, 4)
         if dump_ore(turn, ore) and not hold_ore(turn, ore):
             score += 40
             tier = max(tier, 4)
@@ -687,6 +712,20 @@ def mine_rank(turn: Turn, keep_stone: bool) -> list[str]:
         scored.append((tier, score, ore))
     scored.sort(reverse=True)
     return [ore for _, _, ore in scored]
+
+
+def apply_fixed_iron_schedule(turn: Turn) -> None:
+    """写入固定铁矿短缺事件，并在涨价日清掉采铁配额以便立刻去卖。"""
+    MEM.events = [item for item in MEM.events if item.ore != IRON]
+    start = min(FIXED_IRON_SELL_DAYS) if FIXED_IRON_SELL_DAYS else 3
+    end = max(FIXED_IRON_SELL_DAYS) if FIXED_IRON_SELL_DAYS else 4
+    MEM.events.append(
+        MarketEvent(IRON, "shortage", start, end, "fixed-iron-schedule"),
+    )
+    if turn.day_no in FIXED_IRON_SELL_DAYS:
+        for unit_id, plan in list(MEM.mine_quota.items()):
+            if plan and plan[0] == IRON:
+                MEM.mine_quota.pop(unit_id, None)
 
 
 def apply_fixed_treasure() -> None:

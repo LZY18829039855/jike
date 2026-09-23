@@ -11,6 +11,7 @@ from .evolve import (
 from .intel import (
     MEM,
     FIXED_TREASURE_DAY,
+    FIXED_IRON_STOCKPILE_UNTIL,
     bad_build_cells,
     dump_ore,
     failed_cells,
@@ -333,7 +334,7 @@ def _worker_day(
         if spent is not None:
             return budget - spent
 
-    # 7) 矿价变高 / 满包 / 急需金币时再卖
+    # 7) 涨价日优先出铁；其它时候满包/急需金币再卖
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
         return budget
 
@@ -1308,28 +1309,33 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
     ores = role.ore_counts()
     if not ores:
         return False
-    if role.backpack_full:
+    copper = ores.get(COPPER, 0)
+    iron = ores.get(IRON, 0)
+    stone = ores.get(WALL_MATERIAL, 0)
+    # 涨价日：有铁立刻卖
+    if iron > 0 and dump_ore(turn, IRON):
         return True
-    # 采卖计划未完成：先采满批次再卖
+    if copper > 0 and dump_ore(turn, COPPER):
+        return True
+    # 囤铁期：包满时只卖铜/超额石头，绝不卖铁
+    if role.backpack_full:
+        if hold_ore(turn, IRON) and iron > 0 and copper <= 0:
+            return stone > STONE_RESERVE
+        return True
+    # 采卖计划未完成：先采满批次再卖（涨价日除外，上面已处理）
     plan = MEM.mine_quota.get(role.unit_id)
     if plan is not None:
         kind, target = plan
         if role.item_count(kind) < target and not role.backpack_full:
             return False
-    copper = ores.get(COPPER, 0)
-    iron = ores.get(IRON, 0)
-    # 矿价变高（新闻短缺/当前价高于默认）优先出货
-    if copper > 0 and dump_ore(turn, COPPER):
-        return True
-    if iron > 0 and dump_ore(turn, IRON):
-        return True
-    # 急需金币建炮时才提前卖
-    value = copper * turn.ore_price(COPPER) + iron * turn.ore_price(IRON)
+    # 急需金币建炮时才提前卖（囤铁期仍不卖铁）
+    value = copper * turn.ore_price(COPPER)
+    if not hold_ore(turn, IRON):
+        value += iron * turn.ore_price(IRON)
     if len(turn.weapons()) < 3 and value >= max(1, WEAPON_BUILD_COST - turn.gold):
         return True
     if turn.gold < 25 and value >= 15:
         return True
-    # 背包压力大时出货，平时囤着等涨价
     if len(role.backpack) >= 30 and value >= 10:
         return True
     return False
@@ -1359,14 +1365,19 @@ def _sell_or_walk(
             # 满包时仍尽量留砌墙库存
             count = max(0, count - STONE_RESERVE)
             if ores.get(COPPER, 0) > 0 or ores.get(IRON, 0) > 0:
-                continue
+                # 囤铁期允许卖超额石头腾背包；涨价日有铁则先卖铁
+                if hold_ore(turn, IRON) and ores.get(IRON, 0) > 0 and ores.get(COPPER, 0) <= 0:
+                    pass
+                else:
+                    continue
         if count <= 0:
             continue
-        if hold_ore(turn, name) and not role.backpack_full:
+        # 严格遵守囤矿：涨价前绝不卖铁
+        if hold_ore(turn, name):
             continue
         price = turn.ore_price(name)
         hot = 1 if dump_ore(turn, name) else 0
-        # 铜优先于铁（同价/非涨价时）
+        # 铜优先于铁（同价/非涨价时）；涨价铁优先
         kind_rank = 2 if name == COPPER else 1 if name == IRON else 0
         key = (hot, price, kind_rank)
         if key > best_key:
@@ -1617,7 +1628,11 @@ def _mine_economy(
     ranked = mine_rank(turn, keep_stone)
     for kind in ranked:
         if kind in {COPPER, IRON}:
-            MEM.mine_quota[role.unit_id] = (kind, MINE_BATCH)
+            batch = MINE_BATCH
+            # 囤铁期尽量采满背包，涨价日一次出清
+            if kind == IRON and turn.day_no <= FIXED_IRON_STOCKPILE_UNTIL:
+                batch = max(MINE_BATCH, role.capacity)
+            MEM.mine_quota[role.unit_id] = (kind, batch)
             if _mine_kind(
                 turn, role, kind, claimed, commands,
                 stay_near=stay_near, max_dist=max_dist,
