@@ -11,6 +11,7 @@ from .evolve import (
 from .intel import (
     MEM,
     FIXED_TREASURE_DAY,
+    FIXED_RITUAL_BUY_FROM_DAY,
     FIXED_IRON_STOCKPILE_UNTIL,
     bad_build_cells,
     dump_ore,
@@ -150,7 +151,7 @@ def _day(
     )
 
     workers = [role for role in turn.workers() if role.unit_id not in commands]
-    mason_id = _pick_mason_id(turn, free_walls)
+    mason_ids = _pick_mason_ids(turn, free_walls)
     # 临夜只需 1 人贴塔（与夜间单炮手一致），另一人继续挖矿
     night_gunner_id = _pick_day_gunner_id(turn, workers)
 
@@ -164,7 +165,7 @@ def _day(
             claimed,
             commands,
             budget,
-            job="mason" if role.unit_id == mason_id else "miner",
+            job="mason" if role.unit_id in mason_ids else "miner",
             night_gunner=(role.unit_id == night_gunner_id),
         )
         if role.unit_id not in commands:
@@ -182,6 +183,24 @@ def _team_stone(turn: Turn) -> int:
     return sum(role.item_count(WALL_MATERIAL) for role in turn.controllable())
 
 
+def _front_wall_progress(turn: Turn) -> float:
+    front = _front_wall_cells(turn)
+    if not front:
+        return 1.0
+    standing = {unit.pos for unit in turn.walls()}
+    legal = [pos for pos in front if pos not in bad_build_cells()]
+    if not legal:
+        return 1.0
+    return sum(1 for pos in legal if pos in standing) / len(legal)
+
+
+def _need_early_walls(turn: Turn) -> bool:
+    """第一天迎敌面未成形前，优先砌墙而不是升炮/挖铁。"""
+    if turn.day_no > 1:
+        return False
+    return _front_wall_progress(turn) < 0.85
+
+
 def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
     """迎敌面墙基本齐、且不临夜缺墙时，视为围墙无风险。"""
     if not walls_missing:
@@ -192,18 +211,20 @@ def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
         return False
     if turn.day_no <= 1 and front_missing:
         return False
+    if _need_early_walls(turn):
+        return False
     return len(front_missing) == 0
 
 
-def _pick_mason_id(turn: Turn, walls_missing: list[Pos]) -> int | None:
-    """指定一名石匠：缺墙或石头未满 20 时采石砌墙；围墙无风险则返回 None（全员挖铜铁）。"""
+def _pick_mason_ids(turn: Turn, walls_missing: list[Pos]) -> set[int]:
+    """开局可派双石匠赶迎敌面；墙稳后最多留 1 人补石砌墙。"""
     workers = list(turn.workers())
     if not workers:
-        return None
+        return set()
     if _walls_safe(turn, walls_missing) and _team_stone(turn) >= STONE_TARGET:
-        return None
+        return set()
     if _walls_safe(turn, walls_missing) and not walls_missing:
-        return None
+        return set()
     stone_mines = turn.stone_mines()
 
     def key(role: Unit) -> tuple:
@@ -218,7 +239,9 @@ def _pick_mason_id(turn: Turn, walls_missing: list[Pos]) -> int | None:
         ) if walls_missing else 99
         return (-stone, near_mine + near_wall, role.unit_id)
 
-    return min(workers, key=key).unit_id
+    ranked = sorted(workers, key=key)
+    count = 2 if _need_early_walls(turn) else 1
+    return {role.unit_id for role in ranked[:count]}
 
 
 def _pick_day_gunner_id(turn: Turn, workers: list[Unit]) -> int | None:
@@ -306,9 +329,10 @@ def _worker_day(
                     return budget - WEAPON_BUILD_COST
                 return budget
 
-    # 5.5) 三炮齐后优先升到二级，不为侧墙分散启动资金
+    # 5.5) 三炮齐后：开局先把迎敌面墙砌起来，再去升炮 L2
     fire_ready = _firepower_ready(turn)
-    if len(turn.weapons()) >= 3 and not fire_ready:
+    early_walls = _need_early_walls(turn)
+    if len(turn.weapons()) >= 3 and not fire_ready and not early_walls:
         if _prefer_weapon_upgrade(turn, role, budget):
             spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
             if spent is not None:
@@ -316,20 +340,24 @@ def _worker_day(
         # 升级未完成：只砌迎敌面，上下侧暂缓
         front = _front_wall_cells(turn)
         walls_missing = [pos for pos in walls_missing if pos in front]
+    elif early_walls:
+        # 第一天赶墙：只铺迎敌面，侧墙稍后
+        front = _front_wall_cells(turn)
+        walls_missing = [pos for pos in walls_missing if pos in front]
 
-    # 6) 石匠：砌墙 + 补石头到 20；矿工不碰石头
+    # 6) 石匠：砌墙 + 补石头；开局双石匠全力赶墙
     if job == "mason" and walls_missing and _wall_work(
         turn, role, walls_missing, claimed, commands,
     ):
         return budget
     if job == "mason" and _team_stone(turn) < STONE_TARGET and (
-        walls_missing or turn.day_no <= 2
+        walls_missing or turn.day_no <= 2 or early_walls
     ):
         if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
             return budget
 
-    # 6.5) 火力已达标后再追更高等级券
-    if fire_ready and _prefer_weapon_upgrade(turn, role, budget):
+    # 6.5) 火力已达标后再追更高等级券（开局赶墙时跳过）
+    if fire_ready and not early_walls and _prefer_weapon_upgrade(turn, role, budget):
         spent = _buy_weapon_upgrade(turn, role, claimed, commands, budget)
         if spent is not None:
             return budget - spent
@@ -464,7 +492,9 @@ def _wall_work(
 ) -> bool:
     stones = role.item_count(WALL_MATERIAL)
     mine = _adjacent_mine(turn, role, WALL_MATERIAL)
-    if mine is not None and stones < STONE_BATCH:
+    # 开局赶墙：有 1 块石头就去砌，别在矿边囤满一批
+    stock_to = 1 if _need_early_walls(turn) and walls_missing else STONE_BATCH
+    if mine is not None and stones < stock_to:
         commands[role.unit_id] = collect_command(mine)
         claimed.add(mine)
         return True
@@ -513,7 +543,7 @@ def _pioneer_day(
     # 第6-7天仍缺祭品：打断当前事务去买齐，确保第8天能开
     if (
         need_ritual_prep(turn, role)
-        and turn.day_no >= 6
+        and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY
         and turn.day_no < FIXED_TREASURE_DAY
         and not turn.near_night
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
@@ -536,9 +566,10 @@ def _pioneer_day(
             return prompt, execute_cmd
         return "", ""
 
-    # 第8天前空档优先买祭品（不打断正在进行的 phaseTask）
+    # 第8天前空档：仅 Day6 起才买祭品（前期钱留给炮墙与铁矿）
     if (
         need_ritual_prep(turn, role)
+        and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY
         and turn.day_no < FIXED_TREASURE_DAY
         and not turn.near_night
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
@@ -752,7 +783,7 @@ def _hunt_treasure(
         return False
     need = missing_ritual(turn, role)
     if turn.day_no < FIXED_TREASURE_DAY:
-        if need:
+        if need and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY:
             return _buy_named_or_walk(turn, role, need[0], claimed, commands, turn.gold)
         return False
     if not turn.is_day:
@@ -976,7 +1007,20 @@ def _solo_rocket_fire(
         if _try_combat_item(turn, role, commands, relaxed=True):
             return True
 
-    # 走向最近的就绪炮；都在冷却则走向冷却最短的
+    # 走向共用操控格；否则走向最近就绪/短冷却炮
+    hub = _gunner_hub(turn, towers, role)
+    if hub is not None and role.pos != hub:
+        covered_ready = [
+            tower for tower in towers
+            if weapon_ready(turn, tower) and distance(hub, tower.pos) <= 1
+        ]
+        if covered_ready or all(distance(hub, tower.pos) <= 1 for tower in towers):
+            claimed.add(hub)
+            step = _step_toward(turn, role, hub, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+                return True
+
     def approach_key(tower: Unit) -> tuple:
         ready = 0 if weapon_ready(turn, tower) else 1
         return (
@@ -1483,7 +1527,7 @@ def _wanted_purchase(
         if item:
             return item
     need = missing_ritual(turn, role)
-    if need:
+    if need and turn.day_no >= FIXED_RITUAL_BUY_FROM_DAY:
         item = can_buy(need[0])
         if item:
             return item
@@ -1872,18 +1916,23 @@ def _stand_cells(
 
 
 def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
+    """三炮直角簇：共用一个操控格，夜战一人不用跑位。"""
     station = turn.station()
     if station is None:
         return ()
     banned = bad_build_cells()
     seeds = weapon_zone_seeds()
     anchor = threat_anchor(turn)
-    cells = [
-        pos for pos in _cells_at_distance(station.pos, 1)
-        if turn.land(pos) and pos not in banned
-    ]
-    # 塔位朝机器人实际来向摆，射程才不浪费；已验证过的格子优先
-    cells.sort(
+    pool: list[Pos] = []
+    for radius in (1, 2):
+        for pos in _cells_at_distance(station.pos, radius):
+            if turn.land(pos) and pos not in banned:
+                pool.append(pos)
+    cluster = _best_tower_l_cluster(turn, pool, seeds, anchor, banned)
+    if len(cluster) >= 3:
+        return tuple(cluster[:3])
+    # 回退：朝来敌方向取 3 格（仍尽量紧凑）
+    pool.sort(
         key=lambda pos: (
             0 if pos in seeds else 1,
             distance(pos, anchor),
@@ -1891,7 +1940,121 @@ def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
             pos.y,
         ),
     )
-    return tuple(cells[:3])
+    return tuple(pool[:3])
+
+
+def _best_tower_l_cluster(
+    turn: Turn,
+    pool: list[Pos],
+    seeds: frozenset[Pos],
+    anchor: Pos,
+    banned: frozenset[Pos],
+) -> list[Pos]:
+    """在同一操控格周围选 3 个炮位，优先 2x2 缺一角的直角形。"""
+    if len(pool) < 3:
+        return []
+    hubs: set[Pos] = set()
+    for pos in pool:
+        for nbr in _neighbours(pos):
+            if (
+                0 <= nbr.x < turn.width
+                and 0 <= nbr.y < turn.height
+                and turn.land(nbr)
+                and nbr not in banned
+            ):
+                hubs.add(nbr)
+
+    best: list[Pos] = []
+    best_key: tuple | None = None
+    for hub in hubs:
+        adj = [pos for pos in pool if distance(pos, hub) == 1]
+        if len(adj) < 3:
+            continue
+        trio = _pick_l_trio(adj, hub, seeds, anchor)
+        if len(trio) < 3:
+            continue
+        # 操控格不能落在炮位上
+        if hub in trio:
+            continue
+        key = (
+            1 if _is_compact_l(trio) else 0,
+            sum(1 for pos in trio if pos in seeds),
+            -sum(distance(pos, anchor) for pos in trio),
+            -distance(hub, anchor),
+            -hub.x,
+            -hub.y,
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best = trio
+    return best
+
+
+def _pick_l_trio(
+    adj: list[Pos],
+    hub: Pos,
+    seeds: frozenset[Pos],
+    anchor: Pos,
+) -> list[Pos]:
+    ranked = sorted(
+        adj,
+        key=lambda pos: (
+            0 if pos in seeds else 1,
+            distance(pos, anchor),
+            distance(pos, hub),
+            pos.x,
+            pos.y,
+        ),
+    )
+    # 先在靠威胁的候选里找真正的直角三元组
+    top = ranked[: min(8, len(ranked))]
+    for i, a in enumerate(top):
+        for j, b in enumerate(top[i + 1 :], i + 1):
+            for c in top[j + 1 :]:
+                trio = [a, b, c]
+                if _is_compact_l(trio):
+                    return trio
+    return list(ranked[:3])
+
+
+def _is_compact_l(cells: list[Pos]) -> bool:
+    """三格落在某个 2x2 里（缺一角）= 直角布局。"""
+    if len(cells) != 3:
+        return False
+    xs = [pos.x for pos in cells]
+    ys = [pos.y for pos in cells]
+    return max(xs) - min(xs) == 1 and max(ys) - min(ys) == 1
+
+
+def _gunner_hub(turn: Turn, towers: list[Unit], role: Unit) -> Pos | None:
+    """夜战站位：尽量同时贴住所有炮。"""
+    if not towers:
+        return None
+    blocked = turn.blocked(role)
+    candidates: set[Pos] = set()
+    for tower in towers:
+        for nbr in _neighbours(tower.pos):
+            if not (0 <= nbr.x < turn.width and 0 <= nbr.y < turn.height):
+                continue
+            if not turn.land(nbr):
+                continue
+            if nbr in blocked and nbr != role.pos:
+                continue
+            if any(nbr == other.pos for other in towers):
+                continue
+            candidates.add(nbr)
+    best: Pos | None = None
+    best_key: tuple | None = None
+    anchor = threat_anchor(turn)
+    for pos in candidates:
+        covered = sum(1 for tower in towers if distance(pos, tower.pos) <= 1)
+        key = (covered, -distance(pos, anchor), -pos.x, -pos.y)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = pos
+    if best_key is None or best_key[0] < 2:
+        return None
+    return best
 
 
 def _base_is_northwest(turn: Turn) -> bool:

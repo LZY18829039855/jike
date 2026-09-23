@@ -27,6 +27,8 @@ FIXED_TREASURE_DAY = 8
 FIXED_TREASURE_PHASE = "day"
 FIXED_TREASURE_POS = Pos(3, 3)
 FIXED_TREASURE_ITEMS = ("AcientTablet", "StarSand", "FlameBreath")
+# 前期金币优先炮/墙与铁矿节奏；Day3–4 卖铁回血后，Day6–7 再买祭品
+FIXED_RITUAL_BUY_FROM_DAY = 6
 
 # 本图官方消息已锁定：铁矿 Day3–4 短缺涨价（与两局日志一致）。
 # Day1–2 囤铁；Day3–4 停采并高价卖铁；Day5 起恢复，主采铜（铜价高于铁）。
@@ -756,11 +758,11 @@ def treasure_ready(turn: Turn) -> bool:
 
 
 def treasure_imminent(turn: Turn) -> bool:
-    """第 8 天前都要抓紧买齐祭品；当天则准备开宝。"""
+    """接近开宝日、且已进入祭品采购窗口时，才视为紧迫。"""
     apply_fixed_treasure()
     if MEM.treasure.done:
         return False
-    return turn.day_no <= FIXED_TREASURE_DAY
+    return FIXED_RITUAL_BUY_FROM_DAY <= turn.day_no <= FIXED_TREASURE_DAY
 
 
 def missing_ritual(turn: Turn, role) -> list[str]:
@@ -783,8 +785,10 @@ def missing_ritual(turn: Turn, role) -> list[str]:
 
 
 def need_ritual_prep(turn: Turn, role) -> bool:
-    """第 8 天白天召唤前，缺祭品就要去买。"""
+    """Day6 起才买祭品；更早把钱留给建设与铁矿套利。"""
     if MEM.treasure.done:
+        return False
+    if turn.day_no < FIXED_RITUAL_BUY_FROM_DAY:
         return False
     if turn.day_no > FIXED_TREASURE_DAY:
         return False
