@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,8 +21,6 @@ from .intel import (
 )
 from .protocol import PlayerTask, Turn, Unit, distance, submit_answer_command
 from .task_bank import lookup_fixed_answer
-
-LOGGER = logging.getLogger(__name__)
 
 
 _JUNK_ANSWER = re.compile(
@@ -314,7 +311,6 @@ def solve(
         if bank_answer:
             payload = patch_task_answer(bank_answer, turn)
             if _accept_bank_payload(payload, task):
-                LOGGER.info("【题库秒交】%s -> %s", bank_id, payload)
                 _commit_answer(role, commands, payload, skill)
                 return "", ""
 
