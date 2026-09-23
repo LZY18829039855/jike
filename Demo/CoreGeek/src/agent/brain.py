@@ -1501,13 +1501,16 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             elif cleared:
                 _buy_or_walk(turn, role, claimed, commands, turn.gold)
             continue
-        # 工人夜里不守炮：有必要物品就采购，否则继续采矿。
-        spent = _buy_or_walk(
-            turn, role, claimed, commands, night_budget,
-        )
-        if spent is not None:
-            night_budget -= spent
-            continue
+        # 工人夜里不守炮：已在商店或清场才采购，否则继续采矿。
+        shop = turn.shop_pos()
+        at_shop = shop is not None and distance(role.pos, shop) <= 1
+        if (cleared or at_shop) and not _should_defer_shop(turn, role):
+            spent = _buy_or_walk(
+                turn, role, claimed, commands, night_budget,
+            )
+            if spent is not None:
+                night_budget -= spent
+                continue
         outside = not cleared and not _behind_robot_front(turn, role.pos)
         _fill_idle_mine(
             turn,
@@ -1517,6 +1520,8 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
             stay_near=None if cleared or outside else anchor,
             max_dist=99 if cleared or outside else (14 if turn.weapons() else 99),
         )
+        if role.unit_id not in commands:
+            _sidestep(turn, role, claimed, commands)
     return prompt, execute_cmd
 
 
@@ -1900,13 +1905,16 @@ def _try_use_upgrade(
                 near,
                 key=lambda unit: (_wall_priority(turn, unit.pos), unit.health),
             )
+            MEM.use_target.pop(role.unit_id, None)
             commands[role.unit_id] = use_command(item, wall.pos)
             return True
         if not walk_walls:
             continue
+        locked = MEM.use_target.get(role.unit_id)
         targets = sorted(
             (wall for wall in pool if wall.pos not in claimed),
             key=lambda unit: (
+                0 if locked is not None and unit.pos == locked else 1,
                 _wall_priority(turn, unit.pos),
                 distance(role.pos, unit.pos),
             ),
@@ -1914,9 +1922,12 @@ def _try_use_upgrade(
         for target in targets:
             step = _step_toward(turn, role, target.pos, claimed)
             if step is not None:
+                MEM.use_target[role.unit_id] = target.pos
                 claimed.add(target.pos)
                 commands[role.unit_id] = move_command(step)
                 return True
+        if oscillation_bans(role.unit_id) and _sidestep(turn, role, claimed, commands):
+            return True
     # 没有可用墙升级券时才修复残墙。
     if _fix_walls(turn, role, claimed, commands, walk=walk_walls):
         return True
@@ -1938,10 +1949,18 @@ def _pick_upgrade_tower(
     free = [tower for tower in towers if tower.pos not in claimed]
     if not free:
         return None
-    return min(
+    locked = MEM.use_target.get(role.unit_id)
+    pick = min(
         free,
-        key=lambda unit: (distance(role.pos, unit.pos), unit.pos.x, unit.pos.y),
+        key=lambda unit: (
+            0 if locked is not None and unit.pos == locked else 1,
+            distance(role.pos, unit.pos),
+            unit.pos.x,
+            unit.pos.y,
+        ),
     )
+    MEM.use_target[role.unit_id] = pick.pos
+    return pick
 
 
 def _wall_max_hp(wall: Unit) -> int:
@@ -1953,6 +1972,7 @@ USE_FAIL_LIMIT = 2
 WALL_UPGRADE_FROM_DAY = 2
 WALL_FIXER_FROM_DAY = 2
 WALL_VOUCHER_BATCH = 4
+FIXER_BATCH = 3
 WALL_DAMAGED_RATIO = 0.8
 
 
@@ -2003,14 +2023,13 @@ def _wall_upgrades_owed(turn: Turn) -> int:
 
 
 def _fixer_owed(turn: Turn) -> bool:
-    """第 2 天起每天至少买 1 个修复包；有残墙且全队手里没有时也补。"""
+    """有残墙且全队修复包不够时才买，不再每天强制跑一趟商店。"""
     if turn.day_no < WALL_FIXER_FROM_DAY:
         return False
-    if MEM.fixer_day != turn.day_no:
-        return True
-    return _team_items(turn, WALL_FIXER) == 0 and any(
-        _wall_damaged(wall) for wall in turn.walls()
-    )
+    damaged = sum(1 for wall in turn.walls() if _wall_damaged(wall))
+    if damaged <= 0:
+        return False
+    return _team_items(turn, WALL_FIXER) < min(damaged, FIXER_BATCH)
 
 
 def _buy_wall_supplies(
@@ -2035,7 +2054,9 @@ def _buy_wall_supplies(
     if owed > 0:
         want = (WALL_UPGRADE_1, owed)
     elif _fixer_owed(turn):
-        want = (WALL_FIXER, 1)
+        damaged = sum(1 for wall in turn.walls() if _wall_damaged(wall))
+        have = _team_items(turn, WALL_FIXER)
+        want = (WALL_FIXER, max(1, min(damaged, FIXER_BATCH) - have))
     if want is None:
         return None
     name, num = want
@@ -2053,6 +2074,8 @@ def _buy_wall_supplies(
         return price * num
     step = _step_toward(turn, role, shop, claimed)
     if step is None:
+        if oscillation_bans(role.unit_id) and _sidestep(turn, role, claimed, commands):
+            return 0
         return None
     commands[role.unit_id] = move_command(step)
     note_purchase(name, role.unit_id, turn.round_no)
@@ -2085,13 +2108,16 @@ def _fix_walls(
     near = [wall for wall in damaged if distance(role.pos, wall.pos) <= 1]
     if near:
         wall = min(near, key=lambda unit: unit.health)
+        MEM.use_target.pop(role.unit_id, None)
         commands[role.unit_id] = use_command(fixer, wall.pos)
         return True
     if not walk:
         return False
+    locked = MEM.use_target.get(role.unit_id)
     for wall in sorted(
         damaged,
         key=lambda unit: (
+            0 if locked is not None and unit.pos == locked else 1,
             _wall_priority(turn, unit.pos),
             unit.health,
             distance(role.pos, unit.pos),
@@ -2101,9 +2127,12 @@ def _fix_walls(
             continue
         step = _step_toward(turn, role, wall.pos, claimed)
         if step is not None:
+            MEM.use_target[role.unit_id] = wall.pos
             claimed.add(wall.pos)
             commands[role.unit_id] = move_command(step)
             return True
+    if oscillation_bans(role.unit_id):
+        return _sidestep(turn, role, claimed, commands)
     return False
 
 
@@ -2237,7 +2266,7 @@ def _buy_or_walk(
         note_purchase(name, role.unit_id, turn.round_no)
         return 0
     if oscillation_bans(role.unit_id):
-        hold_idle(role.unit_id)
+        _sidestep(turn, role, claimed, commands)
         return 0
     return None
 
@@ -2304,9 +2333,11 @@ def _wanted_purchase(
             item = can_buy(WALL_UPGRADE_2)
             if item:
                 return item
-    # 4) 残墙先补血，比重建便宜（阈值放宽，尽早买 WallFixer）
-    if any(wall.health * 5 < _wall_max_hp(wall) * 4 for wall in walls):
-        item = can_buy(WALL_FIXER, stack=2)
+    # 4) 残墙且全队没有修复包才买，避免每人各买 1 个来回跑
+    if _team_items(turn, WALL_FIXER) == 0 and any(
+        _wall_damaged(wall) for wall in walls
+    ):
+        item = can_buy(WALL_FIXER, stack=1)
         if item:
             return item
     need = missing_ritual(turn, role)
@@ -2538,10 +2569,9 @@ def _mine_kind(
         if step is not None:
             commands[role.unit_id] = move_command(step)
             return True
-        # 堵路/防抖：本回合待命，别换矿点来回抖
-        if oscillation_bans(role.unit_id):
-            hold_idle(role.unit_id)
-            return True
+        claimed.discard(mine)
+    if oscillation_bans(role.unit_id):
+        return _sidestep(turn, role, claimed, commands)
     return False
 
 
@@ -2575,9 +2605,9 @@ def _build_or_walk(
     if step is not None:
         commands[role.unit_id] = move_command(step)
         return True
+    claimed.discard(target)
     if oscillation_bans(role.unit_id):
-        hold_idle(role.unit_id)
-        return True
+        return _sidestep(turn, role, claimed, commands)
     return False
 
 
@@ -2591,6 +2621,8 @@ def _step_or_idle(
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        return
+    _sidestep(turn, role, claimed, commands)
 
 
 def _step_onto(
@@ -2749,6 +2781,48 @@ def _dedupe_role_commands(
             unit_ids.sort()
         for uid in unit_ids[1:]:
             commands.pop(uid, None)
+
+
+def _refill_idle_roles(
+    turn: Turn, commands: dict[int, dict[str, Any]],
+) -> None:
+    """去重或寻路失败后补一条就近动作，避免整回合交空指令。"""
+    claimed: set[Pos] = set()
+    controllers: set[int] = set()
+    for command in commands.values():
+        if command.get("action") == "attack":
+            raw_id = command.get("controllerId")
+            if raw_id is not None:
+                controllers.add(int(raw_id))
+        targets = command.get("targetPos") or ()
+        if not targets:
+            continue
+        raw = targets[0]
+        claimed.add(Pos(int(raw["x"]), int(raw["y"])))
+    pioneer = turn.pioneer()
+    for role in turn.controllable():
+        if role.unit_id in commands or role.unit_id in controllers:
+            continue
+        if (
+            pioneer is not None
+            and role.unit_id == pioneer.unit_id
+            and turn.phase_task.strip()
+            and _near_task_point(turn, role)
+        ):
+            continue
+        at_tower = any(
+            distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
+        )
+        if not turn.is_day and at_tower:
+            _fill_idle_mine(
+                turn, role, claimed, commands, adjacent_only=True,
+            )
+            continue
+        if _fill_idle_mine(turn, role, claimed, commands, adjacent_only=True):
+            continue
+        if not turn.is_day and _robots_attacking(turn) and not at_tower:
+            continue
+        _sidestep(turn, role, claimed, commands)
 
 
 def _stand_cells(
