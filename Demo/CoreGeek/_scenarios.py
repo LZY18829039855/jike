@@ -277,15 +277,17 @@ check(
 reset_memory()
 probe = frame(roundNo=20)
 decide(probe)
-MEM.treasure.pos = Pos(20, 10)
-MEM.treasure.items = ["StarSand"]
-MEM.treasure.day = 3
 failed = frame(roundNo=21, lastSummonTreasureResult=2)
 decide(failed)
 check(
-    "宝藏结果码2不再武断修改日期",
-    MEM.treasure.day == 3 and MEM.treasure.weak,
-    (MEM.treasure.day, MEM.treasure.weak),
+    "写死宝藏失败后仍保持固定方案",
+    (
+        MEM.treasure.day == 8
+        and not MEM.treasure.weak
+        and MEM.treasure.pos == Pos(3, 3)
+        and MEM.treasure.items == ["AcientTablet", "StarSand", "FlameBreath"]
+    ),
+    (MEM.treasure.day, MEM.treasure.weak, MEM.treasure.pos, MEM.treasure.items),
 )
 
 reset_memory()

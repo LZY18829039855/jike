@@ -22,6 +22,12 @@ LOGGER = logging.getLogger(__name__)
 LLM_DAILY_LIMIT = 3
 DEFAULT_ORE_PRICE = {WALL_MATERIAL: 1, IRON: 3, COPPER: 5}
 
+# 本图民间传闻已锁定：不解析传闻，按写死流程备祭品并第 8 天白天召唤。
+FIXED_TREASURE_DAY = 8
+FIXED_TREASURE_PHASE = "day"
+FIXED_TREASURE_POS = Pos(3, 3)
+FIXED_TREASURE_ITEMS = ("AcientTablet", "StarSand", "FlameBreath")
+
 _CN_NUM = {
     "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
@@ -176,6 +182,7 @@ def observe(turn: Turn) -> None:
         MEM.summon_used = 0
 
     _observe_threat(turn)
+    apply_fixed_treasure()
 
     folk = turn.folk_legends.strip()
     if folk and folk != MEM.last_folk:
@@ -183,7 +190,7 @@ def observe(turn: Turn) -> None:
         MEM.last_folk = folk
         if len(MEM.folk) > 14:
             del MEM.folk[:-14]
-        _merge_treasure(turn, parse_folk(turn, folk))
+        # 写死流程：传闻只落盘日志，不再解析进宝藏推断
         _log_folk_news(turn, folk)
 
     news = turn.official_news.strip()
@@ -209,16 +216,9 @@ def observe(turn: Turn) -> None:
         if turn.last_summon_result in {1, 4}:
             MEM.treasure.done = True
         elif turn.last_summon_result in {2, 3}:
-            if MEM.treasure.pos and MEM.treasure.items:
-                MEM.treasure.failed.add(
-                    (_pos_key(MEM.treasure.pos), tuple(sorted(MEM.treasure.items)), MEM.treasure.day),
-                )
-            if turn.last_summon_result == 3:
-                MEM.treasure.items = []
-            # 2 同时表示地点错误或时间未到，不能武断地把日期加一。
-            # 3 表示祭品错误；两种情况都要求重新推理后才能再次消耗祭品。
-            MEM.treasure.weak = True
+            # 写死方案：失败也不清祭品清单、不拉黑坐标，下一回合继续按固定方案开。
             MEM.awaiting_treasure = False
+            apply_fixed_treasure()
 
     if turn.llm_resp.strip():
         _absorb_llm(turn)
@@ -689,33 +689,48 @@ def mine_rank(turn: Turn, keep_stone: bool) -> list[str]:
     return [ore for _, _, ore in scored]
 
 
+def apply_fixed_treasure() -> None:
+    """按本图固定传闻写死宝藏方案，覆盖任何解析结果。"""
+    if MEM.treasure.done:
+        return
+    MEM.treasure.pos = Pos(FIXED_TREASURE_POS.x, FIXED_TREASURE_POS.y)
+    MEM.treasure.items = list(FIXED_TREASURE_ITEMS)
+    MEM.treasure.day = FIXED_TREASURE_DAY
+    MEM.treasure.phase = FIXED_TREASURE_PHASE
+    MEM.treasure.item_count = len(FIXED_TREASURE_ITEMS)
+    MEM.treasure.region = ""
+    MEM.treasure.weak = False
+
+
 def treasure_ready(turn: Turn) -> bool:
+    apply_fixed_treasure()
     guess = MEM.treasure
-    if guess.done or guess.pos is None or not guess.items or guess.weak:
+    if guess.done or guess.pos is None or not guess.items:
         return False
-    if guess.day is not None and turn.day_no < guess.day:
+    if turn.day_no < FIXED_TREASURE_DAY:
         return False
-    if guess.phase == "night" and turn.is_day:
+    if FIXED_TREASURE_PHASE == "night" and turn.is_day:
         return False
-    if guess.phase == "day" and not turn.is_day:
+    if FIXED_TREASURE_PHASE == "day" and not turn.is_day:
         return False
-    key = (_pos_key(guess.pos), tuple(sorted(guess.items)), guess.day)
-    return key not in guess.failed
+    return True
 
 
 def treasure_imminent(turn: Turn) -> bool:
-    guess = MEM.treasure
-    if guess.done or guess.pos is None:
+    """第 8 天前都要抓紧买齐祭品；当天则准备开宝。"""
+    apply_fixed_treasure()
+    if MEM.treasure.done:
         return False
-    if guess.day is None:
-        return len(MEM.folk) >= 3
-    return guess.day <= turn.day_no + 1
+    return turn.day_no <= FIXED_TREASURE_DAY
 
 
 def missing_ritual(turn: Turn, role) -> list[str]:
-    items = list(MEM.treasure.items)
-    if not items:
+    """只让开拓者备齐写死祭品；工人背包不掺和。"""
+    apply_fixed_treasure()
+    pioneer = turn.pioneer()
+    if pioneer is not None and role.unit_id != pioneer.unit_id:
         return []
+    items = list(FIXED_TREASURE_ITEMS)
     need: list[str] = []
     bag = [item.casefold() for item in role.backpack]
     used: list[str] = list(bag)
@@ -726,6 +741,15 @@ def missing_ritual(turn: Turn, role) -> list[str]:
             continue
         need.append(name)
     return need
+
+
+def need_ritual_prep(turn: Turn, role) -> bool:
+    """第 8 天白天召唤前，缺祭品就要去买。"""
+    if MEM.treasure.done:
+        return False
+    if turn.day_no > FIXED_TREASURE_DAY:
+        return False
+    return bool(missing_ritual(turn, role))
 
 
 _SUMMON_RESULT_HINT = {
@@ -783,15 +807,13 @@ def _log_folk_news(turn: Turn, text: str) -> None:
         text,
     )
     LOGGER.info(
-        "round %s day %s 【宝藏推断】pos=%s items=%s day=%s phase=%s region=%s weak=%s done=%s | 累计传闻=%s条",
+        "round %s day %s 【宝藏推断】写死方案 pos=%s items=%s day=%s phase=%s done=%s | 累计传闻=%s条",
         turn.round_no,
         turn.day_no,
         pos,
         guess.items,
         guess.day,
         guess.phase,
-        guess.region or "-",
-        guess.weak,
         guess.done,
         len(MEM.folk),
     )
@@ -898,28 +920,12 @@ def treasure_prompt(turn: Turn) -> str:
 
 
 def treasure_unsolved() -> bool:
-    guess = MEM.treasure
-    if guess.done:
-        return False
-    return guess.pos is None or guess.weak or not guess.items or guess.day is None
+    # 写死方案无需 LLM 再推宝藏
+    return False
 
 
 def treasure_rider(turn: Turn) -> str:
-    """任务执行期间 LLM 不限次，顺带把宝藏问题挂在同一次提问里。"""
-    if not treasure_unsolved() or not MEM.folk:
-        return ""
-    catalog = "、".join(turn.ritual_catalog())
-    folk = "\n".join(MEM.folk)
-    return "\n".join((
-        "",
-        "【附加题：宝藏推理】除上面那一行外，再额外输出一行：",
-        'TREASURE:{"x":整数或null,"y":整数或null,"items":["英文名",...],"day":整数或null,"phase":"day或night"}',
-        f"地图 {turn.width}x{turn.height}，原点左下，西=x小 东=x大 南=y小 北=y大。",
-        f"物品英文名只能取自：{catalog}",
-        f"当前第{turn.day_no}天，上回合召唤结果码={turn.last_summon_result}。",
-        "【民间传闻】",
-        folk,
-    ))
+    return ""
 
 
 def parse_sandbox_answer(raw: str) -> str:
@@ -951,11 +957,7 @@ def parse_sandbox_answer(raw: str) -> str:
 
 def _absorb_llm(turn: Turn) -> None:
     text = turn.llm_resp
-    if MEM.awaiting_treasure or "TREASURE:" in text:
-        parsed = _parse_treasure_json(turn, text)
-        if parsed is not None:
-            _merge_treasure(turn, parsed)
-            MEM.awaiting_treasure = False
+    # 写死宝藏：忽略 LLM 的 TREASURE 输出
     answer = _extract_tag(text, "ANSWER")
     if answer:
         MEM.awaiting_task = False

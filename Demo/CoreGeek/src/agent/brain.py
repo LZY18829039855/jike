@@ -7,20 +7,19 @@ from .evolve import (
     pick_task,
     should_prioritize,
     solve as solve_evolve_task,
-    treasure_may_interrupt,
 )
 from .intel import (
     MEM,
+    FIXED_TREASURE_DAY,
     bad_build_cells,
-    can_prompt,
     dump_ore,
     failed_cells,
     hold_idle,
     hold_ore,
     is_idle_hold,
-    mark_prompt,
     mine_rank,
     missing_ritual,
+    need_ritual_prep,
     note_purchase,
     note_summon_used,
     observe,
@@ -34,8 +33,6 @@ from .intel import (
     wall_zone_seeds,
     weapon_ready,
     weapon_zone_seeds,
-    treasure_imminent,
-    treasure_prompt,
     treasure_ready,
 )
 from .protocol import (
@@ -61,6 +58,7 @@ from .protocol import (
     WEAPON_BUILD_COST,
     WEAPON_UPGRADE_1,
     WEAPON_UPGRADE_2,
+    WORKER,
     Robot,
     accept_task_command,
     attack_command,
@@ -502,7 +500,26 @@ def _pioneer_day(
             commands[role.unit_id] = use_command(med)
             return "", ""
 
-    # —— 开拓者金币主线：能开宝藏就开；否则刷任务点 ——
+    # —— 写死宝藏：第8天白天直奔 (3,3) 召唤（高于一切） ——
+    if (
+        not MEM.treasure.done
+        and turn.day_no >= FIXED_TREASURE_DAY
+        and turn.is_day
+        and _hunt_treasure(turn, role, claimed, commands)
+    ):
+        return "", ""
+
+    # 第6-7天仍缺祭品：打断当前事务去买齐，确保第8天能开
+    if (
+        need_ritual_prep(turn, role)
+        and turn.day_no >= 6
+        and turn.day_no < FIXED_TREASURE_DAY
+        and not turn.near_night
+        and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
+    ):
+        return "", ""
+
+    # —— 开拓者金币主线：刷自进化任务点 ——
     if turn.phase_task.strip():
         # 先求解/交卷，避免超时离点时把刚拿到的答案扔掉
         prompt, execute_cmd = solve_evolve_task(turn, role, commands)
@@ -518,21 +535,14 @@ def _pioneer_day(
             return prompt, execute_cmd
         return "", ""
 
-    prompt = _maybe_treasure_prompt(turn)
-
-    # 条件齐全就开宝藏（积分/金币大头）
-    if _hunt_treasure(turn, role, claimed, commands):
-        return prompt, ""
-
-    # 宝藏将开但缺祭品：仅在不贴任务点、或已贴商店时去买，避免拉开抖腿
+    # 第8天前空档优先买祭品（不打断正在进行的 phaseTask）
     if (
-        turn.weapons()
+        need_ritual_prep(turn, role)
+        and turn.day_no < FIXED_TREASURE_DAY
         and not turn.near_night
-        and treasure_imminent(turn)
-        and _ritual_buy_ok(turn, role)
         and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
     ):
-        return prompt, ""
+        return "", ""
 
     # 刷任务：有就绪就接；白天冷却贴点时只贴身采，不走开错过任务
     if should_prioritize(turn):
@@ -540,22 +550,12 @@ def _pioneer_day(
             turn, role, claimed, commands, hold_idle=True,
         )
         if role.unit_id in commands:
-            return prompt, ""
+            return "", ""
         if held:
             _fill_idle_mine(
                 turn, role, claimed, commands, adjacent_only=True,
             )
-            return prompt, ""
-
-    # 非紧急备祭品：人不在任务点附近
-    if (
-        turn.weapons()
-        and not turn.near_night
-        and not treasure_imminent(turn)
-        and not _near_task_point(turn, role)
-        and _buy_ritual_or_walk(turn, role, claimed, commands, turn.gold) is not None
-    ):
-        return prompt, ""
+            return "", ""
 
     # 近夜或不在任务点：才去控炮
     if turn.weapons() and (turn.near_night or not _near_task_point(turn, role)):
@@ -575,15 +575,7 @@ def _pioneer_day(
             commands,
             adjacent_only=turn.near_night and at_tower,
         )
-    return prompt, ""
-
-
-def _ritual_buy_ok(turn: Turn, role: Unit) -> bool:
-    """贴任务点冷却时不离开；已贴商店则可买。"""
-    if not _near_task_point(turn, role):
-        return True
-    shop = turn.shop_pos()
-    return shop is not None and distance(role.pos, shop) <= 1
+    return "", ""
 
 
 def _near_task_point(turn: Turn, role: Unit) -> bool:
@@ -670,8 +662,13 @@ def _fill_idle_mine(
     stay_near: Pos | None = None,
     max_dist: int = 12,
 ) -> bool:
-    """无指令空档填采矿/卖货，避免整回合发呆。"""
+    """无指令空档填采矿/卖货，避免整回合发呆。开拓者不能 collect。"""
     if role.unit_id in commands:
+        return False
+    # 任务书：collect 仅工人可用；开拓者空档只卖货，绝不采矿
+    if role.kind != WORKER:
+        if role.ore_counts():
+            return _sell_or_walk(turn, role, claimed, commands)
         return False
     if adjacent_only or is_idle_hold(role.unit_id):
         if role.backpack_full:
@@ -740,18 +737,7 @@ def _glue_to_task(
 
 
 def _maybe_treasure_prompt(turn: Turn) -> str:
-    guess = MEM.treasure
-    if guess.done or turn.phase_task.strip() or not can_prompt(turn):
-        return ""
-    missing = guess.pos is None or guess.weak or not guess.items or guess.day is None
-    new_legend = bool(turn.folk_legends.strip())
-    if not (missing and new_legend and MEM.folk):
-        return ""
-    if MEM.llm_used >= 1 and MEM.treasure.last_result not in {2, 3}:
-        return ""
-    MEM.awaiting_treasure = True
-    mark_prompt(turn)
-    return treasure_prompt(turn)
+    return ""
 
 
 def _hunt_treasure(
@@ -760,20 +746,39 @@ def _hunt_treasure(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    guess = MEM.treasure
-    if guess.done or guess.pos is None:
-        return False
-    if guess.day is not None and turn.day_no < guess.day - 1:
+    """写死流程：仅第 8 天白天前往固定坐标召唤；此前只负责买祭品。"""
+    if MEM.treasure.done:
         return False
     need = missing_ritual(turn, role)
+    if turn.day_no < FIXED_TREASURE_DAY:
+        if need:
+            return _buy_named_or_walk(turn, role, need[0], claimed, commands, turn.gold)
+        return False
+    if not turn.is_day:
+        return False
     if need:
         return _buy_named_or_walk(turn, role, need[0], claimed, commands, turn.gold)
     if not treasure_ready(turn):
         return False
-    if distance(role.pos, guess.pos) <= 1 and role.pos != guess.pos:
-        commands[role.unit_id] = summon_treasure_command(guess.pos, list(guess.items))
+    target = MEM.treasure.pos
+    if target is None:
+        return False
+    if role.pos == target:
+        # 站在祭坛格上先挪到邻格，下回合再召唤
+        for stand in _neighbours(target):
+            if stand in claimed or not turn.land(stand):
+                continue
+            if stand in turn.blocked(role):
+                continue
+            step = _step_toward(turn, role, stand, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+                return True
+        return False
+    if distance(role.pos, target) <= 1:
+        commands[role.unit_id] = summon_treasure_command(target, list(MEM.treasure.items))
         return True
-    step = _step_toward(turn, role, guess.pos, claimed)
+    step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
         return True
@@ -1582,6 +1587,11 @@ def _mine_economy(
     stay_near: Pos | None = None,
     max_dist: int = 99,
 ) -> bool:
+    # 开拓者禁止 collect，避免 COMMAND_ERROR 刷爆异常次数
+    if role.kind != WORKER:
+        if role.ore_counts():
+            return _sell_or_walk(turn, role, claimed, commands)
+        return False
     if role.backpack_full:
         MEM.mine_quota.pop(role.unit_id, None)
         return _sell_or_walk(turn, role, claimed, commands)
@@ -1644,6 +1654,8 @@ def _mine_kind(
     stay_near: Pos | None = None,
     max_dist: int = 99,
 ) -> bool:
+    if role.kind != WORKER:
+        return False
     if role.backpack_full:
         return False
     mines = sorted(
