@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from itertools import permutations
 from typing import Any
 
 from .grid import next_step
@@ -43,7 +42,6 @@ from .protocol import (
     BOMB,
     BOSS_SUMMON,
     COPPER,
-    DAY_ROUNDS,
     DIZZY,
     IRON,
     LARGE_SUMMON,
@@ -79,14 +77,13 @@ from .protocol import (
 )
 
 TOWER_LOADOUT = ("rocket", "rocket", "rocket")
-STONE_RESERVE = 12
+STONE_TARGET = 20  # 砌墙库存上限，够用即可
+STONE_RESERVE = 20
 STONE_BATCH = 10
 MINE_BATCH = 8
 WEAPON_UPGRADE_RESERVE = 100
-# 夜里前段最多 2 人控炮；近敌后再拉满 3
-NIGHT_EARLY_ROUNDS = 20
-NIGHT_EARLY_GUNNERS = 2
-NIGHT_THREAT_DIST = 12
+# 三座火箭冷却 3 回合：一人轮流开火即可，其余专职采矿
+NIGHT_ROCKET_GUNNERS = 1
 SUMMON_ORDERS = (BOSS_SUMMON, LARGE_SUMMON, MIDDLE_SUMMON, SMALL_SUMMON)
 ROBOT_ATTACK = {
     "smallRobot": 5,
@@ -153,9 +150,12 @@ def _day(
         turn, sites, free_towers, free_walls, claimed, commands,
     )
 
-    for role in turn.workers():
-        if role.unit_id in commands:
-            continue
+    workers = [role for role in turn.workers() if role.unit_id not in commands]
+    mason_id = _pick_mason_id(turn, free_walls)
+    # 临夜只需 1 人贴塔（与夜间单炮手一致），另一人继续挖矿
+    night_gunner_id = _pick_day_gunner_id(turn, workers)
+
+    for role in workers:
         budget = _worker_day(
             turn,
             role,
@@ -165,9 +165,10 @@ def _day(
             claimed,
             commands,
             budget,
+            job="mason" if role.unit_id == mason_id else "miner",
+            night_gunner=(role.unit_id == night_gunner_id),
         )
         if role.unit_id not in commands:
-            # 入夜前贴塔：只贴身采，不走开；其余空档全力采矿
             _fill_idle_mine(
                 turn,
                 role,
@@ -176,6 +177,63 @@ def _day(
                 adjacent_only=_holding_line(turn, role),
             )
     return prompt, execute_cmd
+
+
+def _team_stone(turn: Turn) -> int:
+    return sum(role.item_count(WALL_MATERIAL) for role in turn.controllable())
+
+
+def _walls_safe(turn: Turn, walls_missing: list[Pos]) -> bool:
+    """迎敌面墙基本齐、且不临夜缺墙时，视为围墙无风险。"""
+    if not walls_missing:
+        return True
+    front = _front_wall_cells(turn)
+    front_missing = [pos for pos in walls_missing if pos in front]
+    if turn.near_night and front_missing:
+        return False
+    if turn.day_no <= 1 and front_missing:
+        return False
+    return len(front_missing) == 0
+
+
+def _pick_mason_id(turn: Turn, walls_missing: list[Pos]) -> int | None:
+    """指定一名石匠：缺墙或石头未满 20 时采石砌墙；围墙无风险则返回 None（全员挖铜铁）。"""
+    workers = list(turn.workers())
+    if not workers:
+        return None
+    if _walls_safe(turn, walls_missing) and _team_stone(turn) >= STONE_TARGET:
+        return None
+    if _walls_safe(turn, walls_missing) and not walls_missing:
+        return None
+    stone_mines = turn.stone_mines()
+
+    def key(role: Unit) -> tuple:
+        stone = role.item_count(WALL_MATERIAL)
+        near_mine = min(
+            (distance(role.pos, mine) for mine in stone_mines),
+            default=99,
+        )
+        near_wall = min(
+            (distance(role.pos, pos) for pos in walls_missing),
+            default=99,
+        ) if walls_missing else 99
+        return (-stone, near_mine + near_wall, role.unit_id)
+
+    return min(workers, key=key).unit_id
+
+
+def _pick_day_gunner_id(turn: Turn, workers: list[Unit]) -> int | None:
+    """临夜回防：只派离炮最近的 1 名工人。"""
+    if not turn.near_night or not turn.weapons() or not workers:
+        return None
+    towers = turn.weapons()
+    return min(
+        workers,
+        key=lambda role: (
+            min(distance(role.pos, tower.pos) for tower in towers),
+            role.unit_id,
+        ),
+    ).unit_id
 
 
 def _holding_line(turn: Turn, role: Unit) -> bool:
@@ -194,6 +252,9 @@ def _worker_day(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
     budget: int,
+    *,
+    job: str = "miner",
+    night_gunner: bool = False,
 ) -> int:
     # 1) 紧急回血
     if role.health <= 80:
@@ -214,8 +275,8 @@ def _worker_day(
     if not turn.near_night and _open_gate(turn, role, claimed, commands):
         return budget
 
-    # 4) 夜间临近：回防塔位
-    if turn.near_night and turn.weapons():
+    # 4) 夜间临近：仅指定 1 名炮手回防，另一人继续挖矿
+    if turn.near_night and turn.weapons() and night_gunner:
         if _man_tower(turn, role, claimed, commands):
             return budget
 
@@ -257,11 +318,16 @@ def _worker_day(
         front = _front_wall_cells(turn)
         walls_missing = [pos for pos in walls_missing if pos in front]
 
-    # 6) 砌墙（火力未成形时列表已收成迎敌面）
-    if walls_missing and _wall_work(
+    # 6) 石匠：砌墙 + 补石头到 20；矿工不碰石头
+    if job == "mason" and walls_missing and _wall_work(
         turn, role, walls_missing, claimed, commands,
     ):
         return budget
+    if job == "mason" and _team_stone(turn) < STONE_TARGET and (
+        walls_missing or turn.day_no <= 2
+    ):
+        if _mine_kind(turn, role, WALL_MATERIAL, claimed, commands):
+            return budget
 
     # 6.5) 火力已达标后再追更高等级券
     if fire_ready and _prefer_weapon_upgrade(turn, role, budget):
@@ -269,7 +335,7 @@ def _worker_day(
         if spent is not None:
             return budget - spent
 
-    # 7) 有铜/铁/涨价矿就尽快卖掉换成金币（采满批次再卖）
+    # 7) 矿价变高 / 满包 / 急需金币时再卖
     if _should_sell(turn, role) and _sell_or_walk(turn, role, claimed, commands):
         return budget
 
@@ -278,8 +344,13 @@ def _worker_day(
     if spent is not None:
         return budget - spent
 
-    # 9) 经济采集：涨价矿 > 铜 > 铁；石头只在仍缺墙时保底
-    if _mine_economy(turn, role, claimed, commands, keep_stone=bool(walls_missing)):
+    # 9) 经济采集：围墙无风险时铜/铁优先；石匠在仍需墙时才掺石头
+    keep_stone = (
+        job == "mason"
+        and not _walls_safe(turn, walls_missing)
+        and bool(walls_missing)
+    )
+    if _mine_economy(turn, role, claimed, commands, keep_stone=keep_stone):
         return budget
     return budget
 
@@ -793,119 +864,134 @@ def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> tuple[str, str]:
     else:
         prompt = _maybe_treasure_prompt(turn)
 
-    # 无任务时开拓者专职炮手（敌方日志 gunner=10011）
-    if (
-        pioneer is not None
-        and pioneer.unit_id not in used_controllers
-        and pioneer.unit_id not in commands
-        and turn.weapons()
-    ):
-        if _man_tower(turn, pioneer, claimed, commands):
-            used_controllers.add(pioneer.unit_id)
-
-    pairs = _assign_towers(turn, used_controllers)
-    for role, _ in pairs:
-        if role.unit_id in commands:
-            continue
-        if _try_use_upgrade(turn, role, commands, claimed):
-            used_controllers.add(role.unit_id)
-            continue
-        if role.health <= 100:
-            med = role.find_item(MEDICINE)
+    # 三火箭 CD=3：只需 1 人轮流控三炮；另外两人立刻采矿，不先贴塔
+    gunner = _pick_night_gunner(turn, used_controllers)
+    if gunner is not None and gunner.unit_id not in commands:
+        if _try_use_upgrade(turn, gunner, commands, claimed):
+            used_controllers.add(gunner.unit_id)
+        elif gunner.health <= 100:
+            med = gunner.find_item(MEDICINE)
             if med:
-                commands[role.unit_id] = use_command(med)
-                used_controllers.add(role.unit_id)
-                continue
-        if _try_combat_item(turn, role, commands):
-            used_controllers.add(role.unit_id)
+                commands[gunner.unit_id] = use_command(med)
+                used_controllers.add(gunner.unit_id)
+        elif _try_combat_item(turn, gunner, commands):
+            used_controllers.add(gunner.unit_id)
+        elif _solo_rocket_fire(turn, gunner, claimed, commands):
+            # attack 挂在武器 ID 上，需标记炮手本回合已占用
+            used_controllers.add(gunner.unit_id)
 
-    fired: set[int] = set()
-    for role, tower in pairs:
-        if role.unit_id in used_controllers or role.unit_id in commands:
+    station = turn.station()
+    anchor = station.pos if station is not None else None
+    gunner_id = gunner.unit_id if gunner is not None else None
+    for role in turn.controllable():
+        if role.unit_id in commands or role.unit_id in used_controllers:
             continue
-        if distance(role.pos, tower.pos) > 1:
-            step = _step_toward(turn, role, tower.pos, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
+        # 唯一炮手：冷却空窗只贴身采；其余角色直接挖铜/铁
+        if role.unit_id == gunner_id:
+            at_tower = any(
+                distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
+            )
+            if at_tower:
+                _fill_idle_mine(
+                    turn, role, claimed, commands, adjacent_only=True,
+                )
+            else:
+                _solo_rocket_fire(turn, role, claimed, commands)
             continue
+        _fill_idle_mine(
+            turn,
+            role,
+            claimed,
+            commands,
+            stay_near=anchor,
+            max_dist=14 if turn.weapons() else 99,
+        )
+    return prompt, execute_cmd
 
-        # 火箭有 3 回合冷却，冷却期改控身边任意一座就绪的塔
-        ready = [
-            unit for unit in turn.weapons()
-            if weapon_ready(turn, unit)
-            and unit.unit_id not in fired
-            and distance(role.pos, unit.pos) <= 1
-        ]
-        if not ready:
-            if _try_combat_item(turn, role, commands, relaxed=True):
-                used_controllers.add(role.unit_id)
-            continue
-        pick = next(
-            (unit for unit in ready if unit.unit_id == tower.unit_id), ready[0],
+
+def _pick_night_gunner(
+    turn: Turn, exclude: set[int],
+) -> Unit | None:
+    """选唯一炮手：优先已贴就绪炮，否则离炮群最近的角色。"""
+    roles = [
+        role for role in turn.controllable() if role.unit_id not in exclude
+    ]
+    towers = list(turn.weapons())
+    if not roles or not towers:
+        return None
+    cap = NIGHT_ROCKET_GUNNERS
+    if cap <= 0:
+        return None
+
+    def score(role: Unit) -> tuple:
+        ready_here = sum(
+            1 for tower in towers
+            if weapon_ready(turn, tower) and distance(role.pos, tower.pos) <= 1
+        )
+        near_any = sum(1 for tower in towers if distance(role.pos, tower.pos) <= 1)
+        nearest = min(distance(role.pos, tower.pos) for tower in towers)
+        # 工人优先当炮手，开拓者尽量留给任务/采矿
+        pioneer_penalty = 1 if role.kind == "pioneer" else 0
+        return (-ready_here, -near_any, nearest, pioneer_penalty, role.unit_id)
+
+    return min(roles, key=score)
+
+
+def _solo_rocket_fire(
+    turn: Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """一人轮流打三座火箭：贴就绪炮就开火，否则走向最近就绪/即将就绪的炮。"""
+    if role.unit_id in commands:
+        return False
+    towers = list(turn.weapons())
+    if not towers:
+        return False
+
+    ready_here = [
+        tower for tower in towers
+        if weapon_ready(turn, tower) and distance(role.pos, tower.pos) <= 1
+    ]
+    if ready_here:
+        pick = max(
+            ready_here,
+            key=lambda tower: (
+                len(_attack_targets(turn, tower)),
+                tower.level,
+                -tower.unit_id,
+            ),
         )
         targets = _attack_targets(turn, pick)
         if targets:
             commands[pick.unit_id] = attack_command(role.unit_id, *targets)
-            fired.add(pick.unit_id)
-            used_controllers.add(role.unit_id)
+            return True
+        if _try_combat_item(turn, role, commands, relaxed=True):
+            return True
 
-    # 夜里炮冷却/无目标/未分到塔：空闲角色就近采矿，别干站
-    station = turn.station()
-    anchor = station.pos if station is not None else None
-    hostiles = bool(turn.hostile_robots())
-    gunners = {role.unit_id for role, _ in pairs}
-    for role in turn.controllable():
-        if role.unit_id in commands:
-            continue
-        at_tower = any(
-            distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()
-        )
-        # 有敌且本回合分到炮/已贴塔：只贴身采，不离防
-        hold_post = hostiles and (at_tower or role.unit_id in gunners)
-        if hold_post:
-            _fill_idle_mine(
-                turn, role, claimed, commands, adjacent_only=True,
-            )
-        else:
-            _fill_idle_mine(
-                turn,
-                role,
-                claimed,
-                commands,
-                stay_near=anchor,
-                max_dist=10 if turn.weapons() else 99,
-            )
-    return prompt, execute_cmd
-
-
-def _assign_towers(
-    turn: Turn, exclude: set[int] | None = None,
-) -> list[tuple[Unit, Unit]]:
-    banned = exclude or set()
-    roles = [role for role in turn.controllable() if role.unit_id not in banned]
-    towers = list(turn.weapons())
-    if not roles or not towers:
-        return []
-    if len(roles) >= len(towers):
-        candidates = (
-            list(zip(assignment, towers))
-            for assignment in permutations(roles, len(towers))
-        )
-    else:
-        candidates = (
-            list(zip(roles, assignment))
-            for assignment in permutations(towers, len(roles))
-        )
-
-    def key(pairs: list[tuple[Unit, Unit]]) -> tuple:
-        distances = [distance(role.pos, tower.pos) for role, tower in pairs]
+    # 走向最近的就绪炮；都在冷却则走向冷却最短的
+    def approach_key(tower: Unit) -> tuple:
+        ready = 0 if weapon_ready(turn, tower) else 1
         return (
-            sum(distances),
-            max(distances, default=0),
-            tuple((role.unit_id, tower.unit_id) for role, tower in pairs),
+            ready,
+            tower.cooldown,
+            distance(role.pos, tower.pos),
+            tower.pos.x,
+            tower.pos.y,
         )
 
-    return min(candidates, key=key)
+    target = min(towers, key=approach_key)
+    if distance(role.pos, target.pos) <= 1:
+        if _try_combat_item(turn, role, commands, relaxed=True):
+            return True
+        return False
+    claimed.add(target.pos)
+    step = _step_toward(turn, role, target.pos, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
+        return True
+    return False
 
 
 def _try_combat_item(
@@ -1227,30 +1313,19 @@ def _should_sell(turn: Turn, role: Unit) -> bool:
             return False
     copper = ores.get(COPPER, 0)
     iron = ores.get(IRON, 0)
-    if copper > 0 or iron > 0:
-        value = copper * turn.ore_price(COPPER) + iron * turn.ore_price(IRON)
-        if dump_ore(turn, COPPER) or dump_ore(turn, IRON):
-            return True
-        if value >= 5:
-            return True
-        if turn.gold < WEAPON_BUILD_COST and value >= 1:
-            return True
-    value = 0
-    for name, count in ores.items():
-        if name == WALL_MATERIAL:
-            continue
-        if count <= 0:
-            continue
-        if hold_ore(turn, name) and not dump_ore(turn, name):
-            continue
-        if dump_ore(turn, name):
-            return True
-        value += count * turn.ore_price(name)
-    if value >= 15:
+    # 矿价变高（新闻短缺/当前价高于默认）优先出货
+    if copper > 0 and dump_ore(turn, COPPER):
         return True
-    if len(turn.weapons()) < 3 and value >= max(5, WEAPON_BUILD_COST - turn.gold):
+    if iron > 0 and dump_ore(turn, IRON):
         return True
-    if turn.gold < 100 and value >= 10:
+    # 急需金币建炮时才提前卖
+    value = copper * turn.ore_price(COPPER) + iron * turn.ore_price(IRON)
+    if len(turn.weapons()) < 3 and value >= max(1, WEAPON_BUILD_COST - turn.gold):
+        return True
+    if turn.gold < 25 and value >= 15:
+        return True
+    # 背包压力大时出货，平时囤着等涨价
+    if len(role.backpack) >= 30 and value >= 10:
         return True
     return False
 
